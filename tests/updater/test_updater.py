@@ -50,3 +50,18 @@ def test_find_executable_checks_windows_scripts_dir(
     monkeypatch.setattr(updater, "_get_repo_root", lambda: tmp_path)
 
     assert updater._find_executable("uv.cmd") == str(uv_cmd)
+
+
+def test_find_executable_ignores_wsl_mnt_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    uv_bin = bin_dir / "uv"
+    uv_bin.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/mnt/c/Users/test/{name}")
+    monkeypatch.setattr(updater, "_get_repo_root", lambda: tmp_path)
+
+    assert updater._find_executable("uv") == str(uv_bin)
