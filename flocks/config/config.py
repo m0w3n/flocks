@@ -329,7 +329,7 @@ class UpdaterConfig(BaseModel):
         description="Source archive format to download. 'auto' picks zip on Windows, tar.gz elsewhere.",
     )
     backup_retain_count: int = Field(
-        5,
+        1,
         description="Number of old version backups to retain under ~/.flocks/version/. Oldest are purged first.",
     )
     provider: Literal["github", "gitlab"] = Field(

@@ -1,9 +1,13 @@
 import shutil
 import subprocess
+import tarfile
+from os import utime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from flocks.cli import service_manager
 from flocks.updater import updater
 
 
@@ -65,3 +69,636 @@ def test_find_executable_ignores_wsl_mnt_paths(
     monkeypatch.setattr(updater, "_get_repo_root", lambda: tmp_path)
 
     assert updater._find_executable("uv") == str(uv_bin)
+
+
+def test_upgrade_page_html_contains_marker_and_version() -> None:
+    html = updater._upgrade_page_html("2026.3.31.1")
+
+    assert "flocks-upgrade-in-progress" in html
+    assert "v2026.3.31.1" in html
+    assert "window.location.reload()" in html
+
+
+def test_upgrade_page_probe_urls_support_ipv6_loopback_fallback() -> None:
+    assert updater._upgrade_page_probe_urls("::", 5173) == [
+        "http://[::1]:5173",
+        "http://127.0.0.1:5173",
+    ]
+
+
+def test_rmtree_onerror_retries_before_logging_skip(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts: list[str] = []
+    warnings: list[tuple[str, dict[str, str]]] = []
+
+    def fake_remove(path: str) -> None:
+        attempts.append(path)
+        raise OSError("locked")
+
+    import time as time_module
+
+    monkeypatch.setattr(updater.os, "chmod", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(time_module, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(updater.log, "warning", lambda event, payload: warnings.append((event, payload)))
+
+    updater._rmtree_onerror(fake_remove, "/tmp/locked", None)
+
+    assert attempts == ["/tmp/locked"] * 5
+    assert warnings == [("updater.rmtree.skip_locked", {"path": "/tmp/locked"})]
+
+
+def test_safe_remove_renames_locked_file_on_windows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    target = tmp_path / "locked.exe"
+    target.write_text("old", encoding="utf-8")
+    original_unlink = Path.unlink
+
+    def fake_unlink(self: Path, *args, **kwargs) -> None:
+        if self == target:
+            raise PermissionError("locked")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(Path, "unlink", fake_unlink)
+
+    updater._safe_remove(target)
+
+    leftovers = list(tmp_path.glob("locked.exe.flocks_old_*"))
+    assert not target.exists()
+    assert len(leftovers) == 1
+
+
+def test_prepare_upgrade_handover_writes_state_and_stops_frontend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FLOCKS_ROOT", str(tmp_path / ".flocks"))
+    paths = service_manager.RuntimePaths(
+        root=tmp_path / ".flocks",
+        run_dir=tmp_path / ".flocks" / "run",
+        log_dir=tmp_path / ".flocks" / "logs",
+        backend_pid=tmp_path / ".flocks" / "run" / "backend.pid",
+        frontend_pid=tmp_path / ".flocks" / "run" / "webui.pid",
+        backend_log=tmp_path / ".flocks" / "logs" / "backend.log",
+        frontend_log=tmp_path / ".flocks" / "logs" / "webui.log",
+    )
+    paths.run_dir.mkdir(parents=True)
+    paths.log_dir.mkdir(parents=True)
+
+    calls: list[tuple[int, str]] = []
+    monkeypatch.setattr(updater, "_current_service_config", lambda: service_manager.ServiceConfig())
+    monkeypatch.setattr(
+        updater,
+        "_start_upgrade_page_server",
+        lambda config, version: {"upgrade_server_pid": 321, "page_dir": str(tmp_path / "page"), "page_log": str(tmp_path / "upgrade.log")},
+    )
+    monkeypatch.setattr(service_manager, "ensure_runtime_dirs", lambda: paths)
+    monkeypatch.setattr(service_manager, "_recorded_port", lambda _pid_file, default: default)
+    monkeypatch.setattr(
+        service_manager,
+        "stop_one",
+        lambda port, _pid_file, name, _console: calls.append((port, name)),
+    )
+
+    payload = updater._prepare_upgrade_handover("2026.3.31.1")
+
+    assert calls == [(5173, "WebUI")]
+    assert payload["upgrade_server_pid"] == 321
+    assert updater._read_upgrade_state()["version"] == "2026.3.31.1"
+
+
+def test_prepare_upgrade_handover_restores_frontend_when_upgrade_page_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FLOCKS_ROOT", str(tmp_path / ".flocks"))
+    paths = service_manager.RuntimePaths(
+        root=tmp_path / ".flocks",
+        run_dir=tmp_path / ".flocks" / "run",
+        log_dir=tmp_path / ".flocks" / "logs",
+        backend_pid=tmp_path / ".flocks" / "run" / "backend.pid",
+        frontend_pid=tmp_path / ".flocks" / "run" / "webui.pid",
+        backend_log=tmp_path / ".flocks" / "logs" / "backend.log",
+        frontend_log=tmp_path / ".flocks" / "logs" / "webui.log",
+    )
+    paths.run_dir.mkdir(parents=True)
+    paths.log_dir.mkdir(parents=True)
+
+    calls: list[tuple[str, bool]] = []
+    monkeypatch.setattr(updater, "_current_service_config", lambda: service_manager.ServiceConfig())
+    monkeypatch.setattr(service_manager, "ensure_runtime_dirs", lambda: paths)
+    monkeypatch.setattr(service_manager, "_recorded_port", lambda _pid_file, default: default)
+    monkeypatch.setattr(
+        service_manager,
+        "stop_one",
+        lambda port, _pid_file, name, _console: calls.append((f"stop:{name}:{port}", True)),
+    )
+
+    def fake_start_frontend(config, _console) -> None:
+        calls.append(("start_frontend", config.skip_frontend_build))
+
+    monkeypatch.setattr(service_manager, "start_frontend", fake_start_frontend)
+    monkeypatch.setattr(updater, "_stop_upgrade_page_server", lambda: calls.append(("stop_page", True)))
+    monkeypatch.setattr(
+        updater,
+        "_start_upgrade_page_server",
+        lambda _config, _version: (_ for _ in ()).throw(RuntimeError("page failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="page failed"):
+        updater._prepare_upgrade_handover("2026.3.31.1")
+
+    assert calls == [
+        ("stop:WebUI:5173", True),
+        ("stop_page", True),
+        ("start_frontend", False),
+    ]
+    assert updater._read_upgrade_state() is None
+
+
+def test_recover_upgrade_state_restarts_frontend_and_clears_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FLOCKS_ROOT", str(tmp_path / ".flocks"))
+    started: list[tuple[int, bool]] = []
+    stopped: list[str] = []
+
+    monkeypatch.setattr(updater, "_stop_upgrade_page_server", lambda: stopped.append("stop"))
+    monkeypatch.setattr(
+        service_manager,
+        "start_frontend",
+        lambda config, _console: started.append((config.frontend_port, config.skip_frontend_build)),
+    )
+    updater._write_upgrade_state(
+        {
+            "version": "2026.3.31.1",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8000,
+            "frontend_host": "127.0.0.1",
+            "frontend_port": 5173,
+            "skip_frontend_build": True,
+        }
+    )
+
+    updater.recover_upgrade_state()
+
+    assert stopped == ["stop"]
+    assert started == [(5173, True)]
+    assert updater._read_upgrade_state() is None
+
+
+def test_recover_upgrade_state_retries_frontend_with_build_when_dist_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FLOCKS_ROOT", str(tmp_path / ".flocks"))
+    starts: list[bool] = []
+
+    monkeypatch.setattr(updater, "_stop_upgrade_page_server", lambda: None)
+
+    def fake_start_frontend(config, _console) -> None:
+        starts.append(config.skip_frontend_build)
+        if config.skip_frontend_build:
+            raise service_manager.ServiceError("missing dist")
+
+    monkeypatch.setattr(service_manager, "start_frontend", fake_start_frontend)
+    updater._write_upgrade_state(
+        {
+            "version": "2026.3.31.1",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8000,
+            "frontend_host": "127.0.0.1",
+            "frontend_port": 5173,
+            "skip_frontend_build": True,
+        }
+    )
+
+    updater.recover_upgrade_state()
+
+    assert starts == [True, False]
+    assert updater._read_upgrade_state() is None
+
+
+def test_recover_upgrade_state_restart_failure_restarts_upgrade_page_and_keeps_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FLOCKS_ROOT", str(tmp_path / ".flocks"))
+    starts: list[bool] = []
+    page_restarts: list[str] = []
+
+    monkeypatch.setattr(updater, "_stop_upgrade_page_server", lambda: None)
+
+    def fake_start_frontend(config, _console) -> None:
+        starts.append(config.skip_frontend_build)
+        raise service_manager.ServiceError("still broken")
+
+    monkeypatch.setattr(service_manager, "start_frontend", fake_start_frontend)
+    monkeypatch.setattr(
+        updater,
+        "_start_upgrade_page_server",
+        lambda _config, version: page_restarts.append(version) or {
+            "upgrade_server_pid": 654,
+            "page_dir": str(tmp_path / "page"),
+            "page_log": str(tmp_path / "upgrade.log"),
+        },
+    )
+    updater._write_upgrade_state(
+        {
+            "version": "2026.3.31.1",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8000,
+            "frontend_host": "127.0.0.1",
+            "frontend_port": 5173,
+            "skip_frontend_build": True,
+        }
+    )
+
+    with pytest.raises(service_manager.ServiceError, match="still broken"):
+        updater.recover_upgrade_state()
+
+    assert starts == [True, False]
+    assert page_restarts == ["2026.3.31.1"]
+    assert updater._read_upgrade_state()["upgrade_server_pid"] == 654
+
+
+def test_start_upgrade_page_server_binds_configured_frontend_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    flocks_root = tmp_path / ".flocks"
+    (flocks_root / "run").mkdir(parents=True)
+    monkeypatch.setenv("FLOCKS_ROOT", str(flocks_root))
+
+    page_dir = tmp_path / "page"
+    page_dir.mkdir()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(updater, "_write_upgrade_page", lambda _version: page_dir)
+    monkeypatch.setattr(updater, "_wait_for_upgrade_page", lambda config: captured.setdefault("wait_host", config.frontend_host))
+    monkeypatch.setattr(
+        updater,
+        "_spawn_detached_process",
+        lambda command, *, cwd, log_path: captured.update({
+            "command": command,
+            "cwd": cwd,
+            "log_path": log_path,
+        }) or SimpleNamespace(pid=4321),
+    )
+
+    config = service_manager.ServiceConfig(frontend_host="0.0.0.0", frontend_port=5173)
+    payload = updater._start_upgrade_page_server(config, "2026.4.1")
+
+    assert payload["upgrade_server_pid"] == 4321
+    assert captured["command"] == [
+        updater.sys.executable,
+        "-m",
+        "http.server",
+        "5173",
+        "--bind",
+        "0.0.0.0",
+        "--directory",
+        str(page_dir.resolve()),
+    ]
+    assert captured["wait_host"] == "0.0.0.0"
+
+
+def test_wait_for_upgrade_page_uses_access_host_for_local_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_urls: list[str] = []
+
+    class _FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url):
+            requested_urls.append(url)
+            return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(updater.httpx, "Client", lambda timeout: _FakeClient())
+    monkeypatch.setattr(service_manager, "access_host", lambda host: "127.0.0.1" if host == "0.0.0.0" else host)
+    monkeypatch.setattr(updater.time, "sleep", lambda _seconds: None)
+
+    updater._wait_for_upgrade_page(service_manager.ServiceConfig(frontend_host="0.0.0.0", frontend_port=5173))
+
+    assert requested_urls == ["http://127.0.0.1:5173"]
+
+
+def test_wait_for_upgrade_page_falls_back_from_ipv6_to_ipv4_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_urls: list[str] = []
+
+    class _FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url):
+            requested_urls.append(url)
+            if url == "http://[::1]:5173":
+                raise OSError("ipv6 unavailable")
+            return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(updater.httpx, "Client", lambda timeout: _FakeClient())
+    monkeypatch.setattr(updater.time, "sleep", lambda _seconds: None)
+
+    updater._wait_for_upgrade_page(service_manager.ServiceConfig(frontend_host="::", frontend_port=5173))
+
+    assert requested_urls == [
+        "http://[::1]:5173",
+        "http://127.0.0.1:5173",
+    ]
+
+
+def test_rollback_failed_update_restores_backup_and_rebuilds_frontend_if_needed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FLOCKS_ROOT", str(tmp_path / ".flocks"))
+    events: list[str] = []
+
+    monkeypatch.setattr(updater, "_restore_backup_archive", lambda backup, root: events.append(f"restore:{backup.name}:{root.name}"))
+    monkeypatch.setattr(updater, "_write_version_marker", lambda version: events.append(f"marker:{version}"))
+    monkeypatch.setattr(updater, "_stop_upgrade_page_server", lambda: events.append("stop_page"))
+    monkeypatch.setattr(updater.shutil, "rmtree", lambda path, ignore_errors=True: events.append(f"rmtree:{Path(path).name}"))
+
+    def fake_start_frontend(config, _console) -> None:
+        events.append(f"start_frontend:{config.skip_frontend_build}")
+        if config.skip_frontend_build:
+            raise service_manager.ServiceError("missing dist")
+
+    monkeypatch.setattr(service_manager, "start_frontend", fake_start_frontend)
+    updater._write_upgrade_state(
+        {
+            "version": "2026.4.1",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8000,
+            "frontend_host": "127.0.0.1",
+            "frontend_port": 5173,
+            "skip_frontend_build": True,
+        }
+    )
+
+    backup_path = tmp_path / "backup.tar.gz"
+    backup_path.write_text("backup", encoding="utf-8")
+    updater._rollback_failed_update(backup_path, tmp_path / "install", "2026.3.31")
+
+    assert events == [
+        "restore:backup.tar.gz:install",
+        "marker:2026.3.31",
+        "stop_page",
+        "start_frontend:True",
+        "start_frontend:False",
+        "rmtree:upgrade-page",
+    ]
+    assert updater._read_upgrade_state() is None
+
+
+def test_rollback_failed_update_keeps_state_and_upgrade_page_when_restore_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FLOCKS_ROOT", str(tmp_path / ".flocks"))
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        updater,
+        "_restore_backup_archive",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("backup broken")),
+    )
+    monkeypatch.setattr(updater, "_write_version_marker", lambda version: events.append(f"marker:{version}"))
+    monkeypatch.setattr(updater, "_stop_upgrade_page_server", lambda: events.append("stop_page"))
+    monkeypatch.setattr(
+        updater,
+        "_start_upgrade_page_server",
+        lambda _config, version: events.append(f"restart_page:{version}") or {
+            "upgrade_server_pid": 777,
+            "page_dir": str(tmp_path / "page"),
+            "page_log": str(tmp_path / "upgrade.log"),
+        },
+    )
+    monkeypatch.setattr(updater.shutil, "rmtree", lambda path, ignore_errors=True: events.append(f"rmtree:{Path(path).name}"))
+
+    def fake_start_frontend(config, _console) -> None:
+        events.append(f"start_frontend:{config.skip_frontend_build}")
+        raise service_manager.ServiceError("frontend still broken")
+
+    monkeypatch.setattr(service_manager, "start_frontend", fake_start_frontend)
+    updater._write_upgrade_state(
+        {
+            "version": "2026.4.1",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8000,
+            "frontend_host": "127.0.0.1",
+            "frontend_port": 5173,
+            "skip_frontend_build": True,
+            "phase": "cutover_applied",
+        }
+    )
+
+    backup_path = tmp_path / "backup.tar.gz"
+    backup_path.write_text("backup", encoding="utf-8")
+    updater._rollback_failed_update(backup_path, tmp_path / "install", "2026.3.31")
+
+    payload = updater._read_upgrade_state()
+    assert events == [
+        "stop_page",
+        "start_frontend:True",
+        "restart_page:2026.3.31",
+    ]
+    assert payload is not None
+    assert payload["phase"] == "rollback_failed"
+    assert payload["upgrade_server_pid"] == 777
+    assert "backup broken" in payload["last_error"]
+
+
+def test_backup_current_version_preserves_webui_dist(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_root = tmp_path / "install"
+    webui_dist = install_root / "webui" / "dist"
+    other_dist = install_root / "dist"
+    webui_dist.mkdir(parents=True)
+    other_dist.mkdir(parents=True)
+    (webui_dist / "index.html").write_text("<html>ok</html>", encoding="utf-8")
+    (other_dist / "ignored.txt").write_text("nope", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+
+    monkeypatch.setattr(updater, "_BACKUP_DIR", backup_dir)
+    backup_path = updater._backup_current_version(install_root, "2026.4.1", retain_count=1)
+
+    assert backup_path is not None
+    with tarfile.open(backup_path, "r:gz") as tar:
+        names = tar.getnames()
+
+    assert "flocks/webui/dist/index.html" in names
+    assert "flocks/dist/ignored.txt" not in names
+
+
+def test_cleanup_old_backups_keeps_latest_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    newest = backup_dir / "flocks-new.tar.gz"
+    middle = backup_dir / "flocks-mid.tar.gz"
+    oldest = backup_dir / "flocks-old.tar.gz"
+    newest.write_text("new", encoding="utf-8")
+    middle.write_text("mid", encoding="utf-8")
+    oldest.write_text("old", encoding="utf-8")
+    utime(oldest, (1, 1))
+    utime(middle, (2, 2))
+    utime(newest, (3, 3))
+
+    monkeypatch.setattr(updater, "_BACKUP_DIR", backup_dir)
+
+    updater._cleanup_old_backups(1)
+
+    assert newest.exists()
+    assert not middle.exists()
+    assert not oldest.exists()
+
+
+@pytest.mark.asyncio
+async def test_perform_update_builds_staged_frontend_before_handover(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "flocks.zip"
+    archive_path.write_text("archive", encoding="utf-8")
+    staged_root = tmp_path / "staged"
+    staged_webui = staged_root / "webui"
+    staged_webui.mkdir(parents=True)
+    (staged_webui / "package.json").write_text("{}", encoding="utf-8")
+    (staged_webui / "dist").mkdir()
+    (staged_webui / "dist" / "index.html").write_text("<html></html>", encoding="utf-8")
+
+    events: list[str] = []
+    async def fake_get_updater_config():
+        return SimpleNamespace(
+            archive_format="zip",
+            sources=["github"],
+            repo="AgentFlocks/Flocks",
+            token=None,
+            gitee_token=None,
+            backup_retain_count=3,
+            base_url=None,
+            gitee_repo=None,
+        )
+
+    async def fake_run_async(cmd, cwd=None, timeout=None):
+        if cmd[1] == "install":
+            events.append("npm-install")
+        elif cmd[:3] == ["/usr/bin/npm", "run", "build"]:
+            events.append("npm-build")
+        else:
+            events.append("uv-sync")
+        return 0, "", ""
+
+    async def fake_download_with_fallback(**_kwargs):
+        return archive_path
+
+    async def fake_sleep(_seconds) -> None:
+        events.append("sleep")
+
+    monkeypatch.setattr(
+        updater,
+        "_get_updater_config",
+        fake_get_updater_config,
+    )
+    monkeypatch.setattr(updater, "_get_repo_root", lambda: tmp_path / "install-root")
+    monkeypatch.setattr(updater, "get_current_version", lambda: "2026.3.31")
+    monkeypatch.setattr(updater, "_download_with_fallback", fake_download_with_fallback)
+    monkeypatch.setattr(updater, "_backup_current_version", lambda *_args, **_kwargs: tmp_path / "backup.tar.gz")
+    monkeypatch.setattr(updater, "_extract_archive", lambda *_args, **_kwargs: staged_root)
+    monkeypatch.setattr(updater, "_run_async", fake_run_async)
+    monkeypatch.setattr(
+        updater,
+        "_find_executable",
+        lambda name: "/usr/bin/npm" if name in {"npm", "npm.cmd"} else "/usr/bin/uv",
+    )
+    monkeypatch.setattr(updater, "_prepare_upgrade_handover", lambda _version: events.append("handover") or {})
+    monkeypatch.setattr(
+        updater,
+        "_replace_install_dir",
+        lambda *_args, **_kwargs: events.append("replace"),
+    )
+    monkeypatch.setattr(updater, "_write_version_marker", lambda version: events.append(f"marker:{version}"))
+    monkeypatch.setattr(updater.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(updater, "_rollback_failed_update", lambda *_args: events.append("rollback"))
+    monkeypatch.setattr(updater.os, "execv", lambda *_args: (_ for _ in ()).throw(OSError("boom")))
+
+    progresses = [step async for step in updater.perform_update("2026.4.1")]
+
+    assert [step.stage for step in progresses][-1] == "error"
+    assert events[:5] == ["npm-install", "npm-build", "handover", "replace", "uv-sync"]
+    assert "marker:2026.4.1" in events
+
+
+@pytest.mark.asyncio
+async def test_perform_update_does_not_handover_when_staged_frontend_build_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "flocks.zip"
+    archive_path.write_text("archive", encoding="utf-8")
+    staged_root = tmp_path / "staged"
+    staged_webui = staged_root / "webui"
+    staged_webui.mkdir(parents=True)
+    (staged_webui / "package.json").write_text("{}", encoding="utf-8")
+
+    events: list[str] = []
+    async def fake_get_updater_config():
+        return SimpleNamespace(
+            archive_format="zip",
+            sources=["github"],
+            repo="AgentFlocks/Flocks",
+            token=None,
+            gitee_token=None,
+            backup_retain_count=3,
+            base_url=None,
+            gitee_repo=None,
+        )
+
+    async def fake_download_with_fallback(**_kwargs):
+        return archive_path
+
+    monkeypatch.setattr(
+        updater,
+        "_get_updater_config",
+        fake_get_updater_config,
+    )
+    monkeypatch.setattr(updater, "_get_repo_root", lambda: tmp_path / "install-root")
+    monkeypatch.setattr(updater, "get_current_version", lambda: "2026.3.31")
+    monkeypatch.setattr(updater, "_download_with_fallback", fake_download_with_fallback)
+    monkeypatch.setattr(updater, "_backup_current_version", lambda *_args, **_kwargs: tmp_path / "backup.tar.gz")
+    monkeypatch.setattr(updater, "_extract_archive", lambda *_args, **_kwargs: staged_root)
+
+    async def fake_run_async(cmd, cwd=None, timeout=None):
+        if cmd[:3] == ["/usr/bin/npm", "run", "build"]:
+            events.append("npm-build")
+            return 1, "", "boom"
+        if cmd[1] == "install":
+            events.append("npm-install")
+            return 0, "", ""
+        events.append("unexpected")
+        return 0, "", ""
+
+    monkeypatch.setattr(updater, "_run_async", fake_run_async)
+    monkeypatch.setattr(
+        updater,
+        "_find_executable",
+        lambda name: "/usr/bin/npm" if name in {"npm", "npm.cmd"} else "/usr/bin/uv",
+    )
+    monkeypatch.setattr(updater, "_prepare_upgrade_handover", lambda _version: events.append("handover") or {})
+    monkeypatch.setattr(updater, "_replace_install_dir", lambda *_args, **_kwargs: events.append("replace"))
+
+    progresses = [step async for step in updater.perform_update("2026.4.1")]
+
+    assert progresses[-1].stage == "error"
+    assert events == ["npm-install", "npm-build"]
