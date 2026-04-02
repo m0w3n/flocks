@@ -2,9 +2,15 @@ import { useState, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeRaw from 'rehype-raw';
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import remarkBreaks from 'remark-breaks';
 import remarkGfm from 'remark-gfm';
 import 'highlight.js/styles/github-dark.css';
+
+const sanitizeSchema = {
+  ...defaultSchema,
+  strip: [...(defaultSchema.strip || []), 'style'],
+};
 
 /**
  * Throttles content updates to at most once per animation frame while streaming.
@@ -72,7 +78,7 @@ export function StreamingMarkdown({ content, isStreaming }: StreamingMarkdownPro
     <div className="prose prose-sm max-w-none">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkBreaks]}
-        rehypePlugins={[rehypeRaw, [rehypeHighlight, { detect: false, ignoreMissing: true }]]}
+        rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema], [rehypeHighlight, { detect: false, ignoreMissing: true }]]}
         components={{
           code({ className, children, ...props }) {
             // Detect block-level code (fenced code block):
