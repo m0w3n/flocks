@@ -93,7 +93,12 @@ def managed_python_bin_dir() -> Path:
 
 
 async def _ensure_managed_python_env() -> str:
-    """Create the managed Python virtualenv on first use."""
+    """Create the managed Python virtualenv on first use.
+
+    Installs the ``mcp`` SDK as a baseline dependency because every Python-based
+    MCP server needs it at runtime (``from mcp.server.fastmcp import FastMCP``).
+    Many community packages fail to declare this dependency explicitly.
+    """
     python_bin = managed_python_executable()
     if Path(python_bin).exists():
         return python_bin
@@ -105,7 +110,28 @@ async def _ensure_managed_python_env() -> str:
     })
     await _run_subprocess([sys.executable, "-m", "venv", str(env_dir)], timeout=180.0)
     await _run_subprocess([python_bin, "-m", "pip", "install", "--upgrade", "pip"], timeout=180.0)
+    await _run_subprocess([python_bin, "-m", "pip", "install", "mcp"], timeout=180.0)
     return python_bin
+
+
+async def _ensure_mcp_sdk(python_bin: str) -> None:
+    """Ensure the ``mcp`` SDK package is installed in the managed virtualenv.
+
+    Many community Python MCP servers depend on ``mcp`` at runtime but fail to
+    declare it in their package metadata, causing ``ModuleNotFoundError`` when
+    the server process starts.  This is a no-op if already installed.
+    """
+    try:
+        await _run_subprocess(
+            [python_bin, "-c", "import mcp"],
+            timeout=10.0,
+        )
+    except RuntimeError:
+        log.info("mcp.installer.mcp_sdk_missing", {"python": python_bin})
+        await _run_subprocess(
+            [python_bin, "-m", "pip", "install", "mcp"],
+            timeout=180.0,
+        )
 
 
 def rewrite_local_command_for_managed_python(command: List[str], pip_package: str | None = None) -> List[str]:
@@ -180,6 +206,7 @@ async def preflight_install(entry: "CatalogEntry") -> None:
 
     elif entry.install.pip and executable not in {"npx", "uvx"}:
         python_bin = await _ensure_managed_python_env()
+        await _ensure_mcp_sdk(python_bin)
         log.info("mcp.installer.pip", {
             "server": entry.id,
             "package": entry.install.pip,
