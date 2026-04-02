@@ -15,10 +15,6 @@ $DefaultBranch = if ([string]::IsNullOrWhiteSpace($env:FLOCKS_DEFAULT_BRANCH)) {
 $DefaultInstallDir = Join-Path (Get-Location) "flocks"
 $InstallDir = if ([string]::IsNullOrWhiteSpace($env:FLOCKS_INSTALL_DIR)) { $DefaultInstallDir } else { $env:FLOCKS_INSTALL_DIR }
 
-if ([string]::IsNullOrWhiteSpace($Version)) {
-    $Version = $DefaultBranch
-}
-
 function Write-Info {
     param([string]$Message)
     Write-Host "[flocks-bootstrap] $Message"
@@ -28,6 +24,38 @@ function Fail {
     param([string]$Message)
     Write-Host "[flocks-bootstrap] error: $Message" -ForegroundColor Red
     exit 1
+}
+
+function Resolve-VersionFromInvocationLine {
+    param([string]$InvocationLine)
+
+    if ([string]::IsNullOrWhiteSpace($InvocationLine)) {
+        return $null
+    }
+
+    $escapedRepoSlug = [Regex]::Escape($RepoSlug)
+    $match = [Regex]::Match(
+        $InvocationLine,
+        "raw\.githubusercontent\.com/$escapedRepoSlug/(?<ref>.+?)/install\.ps1"
+    )
+    if (-not $match.Success) {
+        return $null
+    }
+
+    $ref = $match.Groups["ref"].Value
+    if ([string]::IsNullOrWhiteSpace($ref)) {
+        return $null
+    }
+
+    return $ref
+}
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = Resolve-VersionFromInvocationLine -InvocationLine $MyInvocation.Line
+}
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = $DefaultBranch
 }
 
 function Show-Usage {

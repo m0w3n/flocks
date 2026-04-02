@@ -1,5 +1,7 @@
 import shutil
 import subprocess
+import textwrap
+import re
 from pathlib import Path
 
 import pytest
@@ -59,6 +61,35 @@ def test_bootstrap_powershell_install_help_supports_scriptblock_invocation() -> 
     assert result.returncode == 0, output
     assert "Remote usage:" in output
     assert "scriptblock" in output
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to inspect PowerShell bootstrap version resolution")
+def test_bootstrap_powershell_scriptblock_resolves_version_from_raw_url() -> None:
+    script = (REPO_ROOT / "install.ps1").read_text(encoding="utf-8")
+    script_without_main = re.sub(r"\nMain\s*$", "\n", script)
+    test_script = (
+        script_without_main
+        + textwrap.dedent(
+            """
+
+            $resolved = Resolve-VersionFromInvocationLine -InvocationLine 'powershell -c "irm https://raw.githubusercontent.com/AgentFlocks/Flocks/fix/windows-update-chain/install.ps1 | iex"'
+            if ($resolved -ne 'fix/windows-update-chain') {
+                Write-Host "resolved=$resolved"
+                exit 1
+            }
+            """
+        ).replace("\n", "\r\n")
+    )
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", test_script],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT.parent,
+    )
+    output = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, output
 
 
 def test_bash_install_help_mentions_optional_tui() -> None:
