@@ -1,6 +1,6 @@
 import React from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import Layout from './Layout';
@@ -129,9 +129,16 @@ function renderHomeWithLayout() {
   );
 }
 
+async function flushEffects() {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0);
+  });
+}
+
 describe('Layout onboarding entry', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.useRealTimers();
     localStorage.clear();
 
     checkUpdate.mockResolvedValue({
@@ -204,5 +211,51 @@ describe('Layout onboarding entry', () => {
     expect(screen.getByRole('button', { name: 'onboarding.bootstrap.editPrimary' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'onboarding.bootstrap.savePrimary' })).not.toBeInTheDocument();
     expect(screen.queryByPlaceholderText('onboarding.bootstrap.tbPlaceholder')).not.toBeInTheDocument();
+  });
+
+  it('polls update checks hourly', async () => {
+    vi.useFakeTimers();
+
+    renderHomeWithLayout();
+
+    await flushEffects();
+    expect(checkUpdate).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_599_999);
+    });
+    expect(checkUpdate).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(checkUpdate).toHaveBeenCalledTimes(2);
+  });
+
+  it('enforces a one-minute minimum gap for focus-triggered update checks', async () => {
+    vi.useFakeTimers();
+
+    renderHomeWithLayout();
+
+    await flushEffects();
+    expect(checkUpdate).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(59_000);
+    });
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+    await flushEffects();
+    expect(checkUpdate).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+    await flushEffects();
+    expect(checkUpdate).toHaveBeenCalledTimes(2);
   });
 });

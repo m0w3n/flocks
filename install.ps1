@@ -1,4 +1,8 @@
-﻿param(
+# Flocks Installer for Windows
+# Usage: powershell -c "irm https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.ps1 | iex"
+#        powershell -c "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.ps1))) -Version main -InstallTui"
+
+param(
     [switch]$InstallTui,
     [string]$Version = $env:VERSION,
     [switch]$Help
@@ -11,10 +15,6 @@ $DefaultBranch = if ([string]::IsNullOrWhiteSpace($env:FLOCKS_DEFAULT_BRANCH)) {
 $DefaultInstallDir = Join-Path (Get-Location) "flocks"
 $InstallDir = if ([string]::IsNullOrWhiteSpace($env:FLOCKS_INSTALL_DIR)) { $DefaultInstallDir } else { $env:FLOCKS_INSTALL_DIR }
 
-if ([string]::IsNullOrWhiteSpace($Version)) {
-    $Version = $DefaultBranch
-}
-
 function Write-Info {
     param([string]$Message)
     Write-Host "[flocks-bootstrap] $Message"
@@ -26,6 +26,10 @@ function Fail {
     exit 1
 }
 
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = $DefaultBranch
+}
+
 function Show-Usage {
     Write-Host "Usage: install.ps1 [-InstallTui] [-Version <tag-or-branch>] [-Help]"
     Write-Host ""
@@ -33,6 +37,10 @@ function Show-Usage {
     Write-Host "This script downloads the GitHub source archive to a temporary directory,"
     Write-Host "copies it to a persistent install location, and delegates to scripts/install.ps1."
     Write-Host "By default it creates a 'flocks' subdirectory under the current directory."
+    Write-Host ""
+    Write-Host "Remote usage:"
+    Write-Host '  powershell -c "irm https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.ps1 | iex"'
+    Write-Host '  powershell -c "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.ps1))) -Version main -InstallTui"'
     Write-Host ""
     Write-Host "Options:"
     Write-Host "  -InstallTui          Also install TUI dependencies."
@@ -52,6 +60,36 @@ function New-TemporaryDirectory {
     $path = Join-Path $basePath $name
     New-Item -ItemType Directory -Path $path -Force | Out-Null
     return $path
+}
+
+function Unblock-InstallFiles {
+    param([string]$TargetDir)
+
+    if ([string]::IsNullOrWhiteSpace($TargetDir) -or -not (Test-Path $TargetDir)) {
+        return
+    }
+
+    try {
+        Get-ChildItem -Path $TargetDir -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
+    }
+    catch {
+    }
+}
+
+function Invoke-WorkspaceInstaller {
+    param(
+        [string]$InstallerPath,
+        [string[]]$InstallerArgs = @()
+    )
+
+    if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
+        Fail "安装脚本路径为空。"
+    }
+
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $InstallerPath @InstallerArgs
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
 }
 
 function Get-ArchiveCandidateUrls {
@@ -132,6 +170,7 @@ function Main {
             Remove-Item -Path $InstallDir -Recurse -Force
         }
         Copy-Item -Path $projectRoot -Destination $InstallDir -Recurse -Force
+        Unblock-InstallFiles -TargetDir $InstallDir
 
         $installerPath = Join-Path $InstallDir "scripts\install.ps1"
         Write-Info "下载来源: $downloadUrl"
@@ -143,7 +182,7 @@ function Main {
             $installerArgs += "-InstallTui"
         }
 
-        & $installerPath @installerArgs
+        Invoke-WorkspaceInstaller -InstallerPath $installerPath -InstallerArgs $installerArgs
     }
     finally {
         if (-not [string]::IsNullOrWhiteSpace($tempDir) -and (Test-Path $tempDir)) {

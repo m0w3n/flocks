@@ -24,8 +24,8 @@ import OnboardingModal, { isOnboardingDismissed } from '@/components/common/Onbo
 import UpdateModal, { UPDATE_DISMISSED_KEY } from '@/components/common/UpdateModal';
 import { checkUpdate } from '@/api/update';
 
-const UPDATE_CHECK_INTERVAL_MS = 60_000;
-const UPDATE_CHECK_MIN_GAP_MS = 15_000;
+const UPDATE_CHECK_INTERVAL_MS = 3_600_000;
+const UPDATE_CHECK_MIN_GAP_MS = 60_000;
 
 export default function Layout() {
   const location = useLocation();

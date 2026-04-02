@@ -15,6 +15,7 @@ console = Console()
 def update_command(
     check: bool = typer.Option(False, "--check", help="仅检查是否有新版本，不执行升级"),
     yes: bool = typer.Option(False, "--yes", "-y", help="跳过确认直接升级"),
+    force: bool = typer.Option(False, "--force", "-f", help="即使已是最新版本也强制重新安装"),
 ):
     """
     Check for and upgrade Flocks to the latest version.
@@ -23,10 +24,10 @@ def update_command(
     current version to ~/.flocks/version/, extracts and replaces source files,
     re-syncs dependencies, then restarts the service automatically.
     """
-    asyncio.run(_update(check=check, yes=yes))
+    asyncio.run(_update(check=check, yes=yes, force=force))
 
 
-async def _update(check: bool, yes: bool) -> None:
+async def _update(check: bool, yes: bool, force: bool = False) -> None:
     from flocks.updater import check_update, perform_update, detect_deploy_mode
 
     with console.status("[cyan]正在检查版本...[/cyan]", spinner="dots"):
@@ -38,7 +39,7 @@ async def _update(check: bool, yes: bool) -> None:
 
     _print_version_table(info)
 
-    if not info.has_update:
+    if not info.has_update and not force:
         console.print("[green]✓ 已是最新版本，无需升级[/green]")
         return
 
@@ -52,11 +53,23 @@ async def _update(check: bool, yes: bool) -> None:
         return
 
     if check:
-        console.print(f"\n[yellow]运行 [bold]flocks update[/bold] 执行升级[/yellow]")
+        command = "flocks update --force" if force else "flocks update"
+        console.print(f"\n[yellow]运行 [bold]{command}[/bold] 执行升级[/yellow]")
         return
 
+    version_to_apply = info.latest_version or info.current_version
+    if not version_to_apply:
+        console.print("[red]无法确定要升级到的版本[/red]")
+        raise typer.Exit(1)
+
+    if force and not info.has_update:
+        console.print(f"[yellow]当前已是最新版本，仍将强制重新安装 v{version_to_apply}[/yellow]")
+
     if not yes:
-        confirmed = typer.confirm("\n是否立即升级？", default=False)
+        prompt = "\n是否立即升级？"
+        if force and not info.has_update:
+            prompt = "\n当前已是最新版本，是否仍强制重新安装？"
+        confirmed = typer.confirm(prompt, default=False)
         if not confirmed:
             console.print("[yellow]已取消[/yellow]")
             return
@@ -76,7 +89,7 @@ async def _update(check: bool, yes: bool) -> None:
     step = 0
 
     async for progress in perform_update(
-        info.latest_version or "",
+        version_to_apply,
         zipball_url=info.zipball_url,
         tarball_url=info.tarball_url,
     ):

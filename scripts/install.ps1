@@ -307,9 +307,9 @@ function Get-RuntimePidFilePaths {
 
     $runDir = Join-Path $flocksRoot "run"
     return @(
-        Join-Path $runDir "backend.pid",
-        Join-Path $runDir "webui.pid",
-        Join-Path $runDir "upgrade_server.pid"
+        (Join-Path $runDir "backend.pid")
+        (Join-Path $runDir "webui.pid")
+        (Join-Path $runDir "upgrade_server.pid")
     )
 }
 
@@ -435,9 +435,9 @@ function Stop-FlocksProcesses {
     }
 
     foreach ($pidFile in Get-RuntimePidFilePaths) {
-        $pid = Get-PidFromRuntimeFile -PidFile $pidFile
-        if ($null -ne $pid) {
-            Stop-TrackedProcess -ProcessId $pid -Reason ("runtime process from {0}" -f $pidFile)
+        $runtimePid = Get-PidFromRuntimeFile -PidFile $pidFile
+        if ($null -ne $runtimePid) {
+            Stop-TrackedProcess -ProcessId $runtimePid -Reason ("runtime process from {0}" -f $pidFile)
         }
     }
 
@@ -458,23 +458,188 @@ function Test-IsLockError {
     return $Text -match '拒绝访问|Access is denied|os error 5|WinError 5|failed to remove directory|Failed to update Windows PE resources'
 }
 
-function Invoke-InstallerCommandWithLockRetry {
-    param(
-        [string]$Description,
-        [scriptblock]$ScriptBlock
-    )
+function Format-CmdArgument {
+    param([AllowNull()][string]$Argument)
 
-    $output = @(& $ScriptBlock 2>&1)
-    $exitCode = $LASTEXITCODE
-    foreach ($entry in $output) {
-        Write-Host ($entry.ToString())
+    if ($null -eq $Argument -or $Argument.Length -eq 0) {
+        return '""'
     }
 
-    if ($exitCode -eq 0) {
+    if ($Argument -notmatch '[\s"&|<>^()]') {
+        return $Argument
+    }
+
+    return '"' + $Argument.Replace('"', '""') + '"'
+}
+
+function Decode-ProcessOutputBytes {
+    param([byte[]]$Bytes)
+
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) {
+        return ""
+    }
+
+    if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) {
+        return [Text.Encoding]::UTF8.GetString($Bytes, 3, $Bytes.Length - 3)
+    }
+
+    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE) {
+        return [Text.Encoding]::Unicode.GetString($Bytes, 2, $Bytes.Length - 2)
+    }
+
+    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFE -and $Bytes[1] -eq 0xFF) {
+        return [Text.Encoding]::BigEndianUnicode.GetString($Bytes, 2, $Bytes.Length - 2)
+    }
+
+    $encodings = [System.Collections.Generic.List[Text.Encoding]]::new()
+    $seenCodePages = [System.Collections.Generic.HashSet[int]]::new()
+
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    $encodings.Add($strictUtf8)
+    $null = $seenCodePages.Add(65001)
+
+    foreach ($encoding in @(
+        [Console]::OutputEncoding,
+        [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage),
+        [Text.Encoding]::Default
+    )) {
+        if ($null -eq $encoding) {
+            continue
+        }
+
+        if ($seenCodePages.Add($encoding.CodePage)) {
+            $encodings.Add($encoding)
+        }
+    }
+
+    foreach ($encoding in $encodings) {
+        try {
+            return $encoding.GetString($Bytes)
+        }
+        catch {
+        }
+    }
+
+    return [Text.Encoding]::UTF8.GetString($Bytes)
+}
+
+function Read-ProcessOutputText {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path $Path)) {
+        return ""
+    }
+
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+    }
+    catch {
+        return ""
+    }
+
+    return Decode-ProcessOutputBytes -Bytes $bytes
+}
+
+function Write-ProcessOutputText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) {
         return
     }
 
-    $combinedOutput = ($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+    [Console]::Write($Text)
+    if (-not $Text.EndsWith("`n") -and -not $Text.EndsWith("`r")) {
+        [Console]::WriteLine()
+    }
+}
+
+function Invoke-NativeCommand {
+    param(
+        [string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [string]$WorkingDirectory = (Get-Location).Path
+    )
+
+    $stdoutPath = [System.IO.Path]::GetTempFileName()
+    $stderrPath = [System.IO.Path]::GetTempFileName()
+
+    try {
+        $resolvedFilePath = $FilePath
+        $resolvedArgs = @($ArgumentList)
+        $commandExtension = [System.IO.Path]::GetExtension($FilePath)
+
+        if ($commandExtension -in @(".cmd", ".bat")) {
+            $cmdParts = [System.Collections.Generic.List[string]]::new()
+            $cmdParts.Add((Format-CmdArgument -Argument $FilePath))
+            foreach ($argument in $ArgumentList) {
+                $cmdParts.Add((Format-CmdArgument -Argument $argument))
+            }
+
+            $resolvedFilePath = "cmd.exe"
+            $resolvedArgs = @("/d", "/s", "/c", ($cmdParts -join " "))
+        }
+
+        $process = Start-Process `
+            -FilePath $resolvedFilePath `
+            -ArgumentList $resolvedArgs `
+            -WorkingDirectory $WorkingDirectory `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath `
+            -Wait `
+            -PassThru `
+            -NoNewWindow
+
+        return [PSCustomObject]@{
+            ExitCode = [int]$process.ExitCode
+            StdOut = Read-ProcessOutputText -Path $stdoutPath
+            StdErr = Read-ProcessOutputText -Path $stderrPath
+        }
+    }
+    finally {
+        foreach ($path in @($stdoutPath, $stderrPath)) {
+            if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path $path)) {
+                Remove-Item -Path $path -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+function Invoke-NativeCommandOrFail {
+    param(
+        [string]$Description,
+        [string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [string]$WorkingDirectory = (Get-Location).Path
+    )
+
+    $result = Invoke-NativeCommand -FilePath $FilePath -ArgumentList $ArgumentList -WorkingDirectory $WorkingDirectory
+    Write-ProcessOutputText -Text $result.StdOut
+    Write-ProcessOutputText -Text $result.StdErr
+
+    if ($result.ExitCode -ne 0) {
+        Fail "$Description 失败。"
+    }
+
+    return $result
+}
+
+function Invoke-InstallerCommandWithLockRetry {
+    param(
+        [string]$Description,
+        [string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [string]$WorkingDirectory = (Get-Location).Path
+    )
+
+    $result = Invoke-NativeCommand -FilePath $FilePath -ArgumentList $ArgumentList -WorkingDirectory $WorkingDirectory
+    Write-ProcessOutputText -Text $result.StdOut
+    Write-ProcessOutputText -Text $result.StdErr
+
+    if ($result.ExitCode -eq 0) {
+        return
+    }
+
+    $combinedOutput = @($result.StdOut, $result.StdErr) -join [Environment]::NewLine
     if (-not (Test-IsLockError -Text $combinedOutput)) {
         Fail "$Description 失败。"
     }
@@ -483,13 +648,11 @@ function Invoke-InstallerCommandWithLockRetry {
     Stop-FlocksProcesses
     Start-Sleep -Seconds 3
 
-    $retryOutput = @(& $ScriptBlock 2>&1)
-    $retryExitCode = $LASTEXITCODE
-    foreach ($entry in $retryOutput) {
-        Write-Host ($entry.ToString())
-    }
+    $retryResult = Invoke-NativeCommand -FilePath $FilePath -ArgumentList $ArgumentList -WorkingDirectory $WorkingDirectory
+    Write-ProcessOutputText -Text $retryResult.StdOut
+    Write-ProcessOutputText -Text $retryResult.StdErr
 
-    if ($retryExitCode -ne 0) {
+    if ($retryResult.ExitCode -ne 0) {
         Fail "$Description 失败。"
     }
 }
@@ -499,9 +662,11 @@ function Install-FlocksCli {
 
     Push-Location $RootDir
     try {
-        Invoke-InstallerCommandWithLockRetry -Description "flocks 全局 CLI 安装" -ScriptBlock {
-            & uv tool install --editable $RootDir --force
-        }
+        Invoke-InstallerCommandWithLockRetry `
+            -Description "flocks 全局 CLI 安装" `
+            -FilePath "uv" `
+            -ArgumentList @("tool", "install", "--editable", $RootDir, "--force") `
+            -WorkingDirectory $RootDir
     }
     finally {
         Pop-Location
@@ -581,17 +746,13 @@ function Install-ChromeForTesting {
     New-Item -ItemType Directory -Path $browserDir -Force | Out-Null
     Write-Info "未检测到系统 Chrome/Chromium，开始安装 Chrome for Testing 到: $browserDir"
 
-    $command = 'npx.cmd --yes @puppeteer/browsers install chrome@stable --path "{0}" 2>&1' -f $browserDir.Replace('"', '""')
-    $output = @(& cmd.exe /d /c $command)
-    $exitCode = $LASTEXITCODE
-    foreach ($entry in $output) {
-        Write-Host ($entry.ToString())
-    }
-    if ($exitCode -ne 0) {
-        Fail "Chrome for Testing 安装失败。"
-    }
+    $result = Invoke-NativeCommandOrFail `
+        -Description "Chrome for Testing 安装" `
+        -FilePath "npx.cmd" `
+        -ArgumentList @("--yes", "@puppeteer/browsers", "install", "chrome@stable", "--path", $browserDir) `
+        -WorkingDirectory $browserDir
 
-    $browserPath = Resolve-ChromeForTestingPath -InstallOutput $output
+    $browserPath = Resolve-ChromeForTestingPath -InstallOutputText (@($result.StdOut, $result.StdErr) -join [Environment]::NewLine)
     if ([string]::IsNullOrWhiteSpace($browserPath)) {
         Fail "Chrome for Testing 安装成功，但未能从安装输出解析浏览器路径。"
     }
@@ -600,10 +761,10 @@ function Install-ChromeForTesting {
 }
 
 function Resolve-ChromeForTestingPath {
-    param([object[]]$InstallOutput)
+    param([string]$InstallOutputText)
 
-    foreach ($entry in $InstallOutput) {
-        $line = $entry.ToString().Trim()
+    foreach ($line in ($InstallOutputText -split "\r?\n")) {
+        $line = $line.Trim()
         if ([string]::IsNullOrWhiteSpace($line)) {
             continue
         }
@@ -642,10 +803,10 @@ function Configure-AgentBrowserBrowser {
 function Install-AgentBrowser {
     if (-not (Test-Command "agent-browser")) {
         Write-Info "安装 agent-browser CLI..."
-        & npm.cmd install --global agent-browser
-        if ($LASTEXITCODE -ne 0) {
-            Fail "agent-browser CLI 安装失败。"
-        }
+        $null = Invoke-NativeCommandOrFail `
+            -Description "agent-browser CLI 安装" `
+            -FilePath "npm.cmd" `
+            -ArgumentList @("install", "--global", "agent-browser")
         Refresh-Path
 
         if (-not (Test-Command "agent-browser")) {
@@ -677,10 +838,11 @@ function Install-DingtalkChannelDeps {
 
     Push-Location $connectorDir
     try {
-        & npm.cmd install
-        if ($LASTEXITCODE -ne 0) {
-            Fail "钉钉 channel npm 依赖安装失败。"
-        }
+        $null = Invoke-NativeCommandOrFail `
+            -Description "钉钉 channel npm 依赖安装" `
+            -FilePath "npm.cmd" `
+            -ArgumentList @("install") `
+            -WorkingDirectory $connectorDir
     }
     finally {
         Pop-Location
@@ -715,9 +877,11 @@ function Main {
     Write-Info "使用 uv sync --group dev 安装 Python 后端依赖（含测试与 lint）..."
     Push-Location $RootDir
     try {
-        Invoke-InstallerCommandWithLockRetry -Description "Python 后端依赖安装" -ScriptBlock {
-            & uv sync --group dev
-        }
+        Invoke-InstallerCommandWithLockRetry `
+            -Description "Python 后端依赖安装" `
+            -FilePath "uv" `
+            -ArgumentList @("sync", "--group", "dev") `
+            -WorkingDirectory $RootDir
     }
     finally {
         Pop-Location
@@ -728,10 +892,11 @@ function Main {
     Write-Info "安装 WebUI 依赖..."
     Push-Location (Join-Path $RootDir "webui")
     try {
-        & npm.cmd install
-        if ($LASTEXITCODE -ne 0) {
-            Fail "WebUI 依赖安装失败。"
-        }
+        $null = Invoke-NativeCommandOrFail `
+            -Description "WebUI 依赖安装" `
+            -FilePath "npm.cmd" `
+            -ArgumentList @("install") `
+            -WorkingDirectory (Join-Path $RootDir "webui")
     }
     finally {
         Pop-Location
@@ -744,10 +909,11 @@ function Main {
         Write-Info "安装 TUI 依赖..."
         Push-Location (Join-Path $RootDir "tui")
         try {
-            & bun install
-            if ($LASTEXITCODE -ne 0) {
-                Fail "TUI 依赖安装失败。"
-            }
+            $null = Invoke-NativeCommandOrFail `
+                -Description "TUI 依赖安装" `
+                -FilePath "bun" `
+                -ArgumentList @("install") `
+                -WorkingDirectory (Join-Path $RootDir "tui")
         }
         finally {
             Pop-Location

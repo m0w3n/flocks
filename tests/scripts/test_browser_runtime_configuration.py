@@ -25,7 +25,10 @@ def test_powershell_installer_prefers_explicit_browser_configuration() -> None:
     assert "Find-SystemBrowserPath" in script
     assert "AGENT_BROWSER_EXECUTABLE_PATH" in script
     assert "Get-ChromeForTestingDir" in script
-    assert "npx.cmd --yes @puppeteer/browsers install chrome@stable --path" in script
+    assert "Invoke-NativeCommandOrFail" in script
+    assert '-FilePath "npx.cmd"' in script
+    assert '"@puppeteer/browsers"' in script
+    assert '"chrome@stable"' in script
     assert '$line -like "chrome@* *"' in script
     assert '$candidate = $line.Substring($firstSpaceIndex + 1).Trim()' in script
     assert 'Join-Path $HOME ".flocks\\browser"' in script

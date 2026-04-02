@@ -6,7 +6,11 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = REPO_ROOT / "scripts"
-POWERSHELL_SCRIPTS = ("install.ps1", "run.ps1")
+POWERSHELL_SCRIPTS = (
+    REPO_ROOT / "install.ps1",
+    SCRIPT_DIR / "install.ps1",
+    SCRIPT_DIR / "run.ps1",
+)
 
 
 def _parse_script(script_path: Path) -> subprocess.CompletedProcess[str]:
@@ -32,7 +36,7 @@ def _parse_script(script_path: Path) -> subprocess.CompletedProcess[str]:
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to parse PowerShell scripts")
-@pytest.mark.parametrize("script_name", POWERSHELL_SCRIPTS)
-def test_powershell_scripts_parse_without_errors(script_name: str) -> None:
-    result = _parse_script(SCRIPT_DIR / script_name)
+@pytest.mark.parametrize("script_path", POWERSHELL_SCRIPTS)
+def test_powershell_scripts_parse_without_errors(script_path: Path) -> None:
+    result = _parse_script(script_path)
     assert result.returncode == 0, result.stdout or result.stderr

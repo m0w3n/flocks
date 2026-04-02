@@ -39,6 +39,34 @@ def test_bootstrap_powershell_install_help_mentions_current_directory_default() 
     assert "current directory" in output
 
 
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to inspect PowerShell scriptblock output")
+def test_bootstrap_powershell_install_help_supports_scriptblock_invocation() -> None:
+    parser_command = (
+        "$bytes = [System.IO.File]::ReadAllBytes("
+        f"'{(REPO_ROOT / 'install.ps1').as_posix()}'"
+        "); "
+        "$content = [System.Text.UTF8Encoding]::new($false, $true).GetString($bytes); "
+        "& ([scriptblock]::Create($content)) -Help"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", parser_command],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT.parent,
+    )
+    output = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, output
+    assert "Remote usage:" in output
+    assert "scriptblock" in output
+
+
+def test_bootstrap_powershell_relies_on_explicit_version_instead_of_invocation_line() -> None:
+    script = (REPO_ROOT / "install.ps1").read_text(encoding="utf-8")
+    assert "Resolve-VersionFromInvocationLine" not in script
+    assert "$Version = $DefaultBranch" in script
+
+
 def test_bash_install_help_mentions_optional_tui() -> None:
     result = subprocess.run(
         ["bash", str(SCRIPT_DIR / "install.sh"), "--help"],
