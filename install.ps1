@@ -1,4 +1,8 @@
-﻿param(
+# Flocks Installer for Windows
+# Usage: powershell -c "irm https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.ps1 | iex"
+#        powershell -c "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.ps1))) -Version main -InstallTui"
+
+param(
     [switch]$InstallTui,
     [string]$Version = $env:VERSION,
     [switch]$Help
@@ -33,6 +37,10 @@ function Show-Usage {
     Write-Host "This script downloads the GitHub source archive to a temporary directory,"
     Write-Host "copies it to a persistent install location, and delegates to scripts/install.ps1."
     Write-Host "By default it creates a 'flocks' subdirectory under the current directory."
+    Write-Host ""
+    Write-Host "Remote usage:"
+    Write-Host '  powershell -c "irm https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.ps1 | iex"'
+    Write-Host '  powershell -c "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/AgentFlocks/Flocks/main/install.ps1))) -Version main -InstallTui"'
     Write-Host ""
     Write-Host "Options:"
     Write-Host "  -InstallTui          Also install TUI dependencies."

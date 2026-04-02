@@ -28,21 +28,35 @@ def test_powershell_installer_stops_processes_before_retrying_locked_operations(
     script = (SCRIPT_DIR / "install.ps1").read_text(encoding="utf-8-sig")
 
     assert "function Stop-FlocksProcesses" in script
+    assert "function Invoke-NativeCommand" in script
     assert "& $flocksCommand.Source stop" in script
     assert 'Join-Path $runDir "upgrade_server.pid"' in script
     assert "Get-CimInstance Win32_Process" in script
-    assert 'Invoke-InstallerCommandWithLockRetry -Description "Python 后端依赖安装"' in script
-    assert 'Invoke-InstallerCommandWithLockRetry -Description "flocks 全局 CLI 安装"' in script
+    assert "Start-Process" in script
+    assert "-RedirectStandardOutput $stdoutPath" in script
+    assert "-RedirectStandardError $stderrPath" in script
+    assert "Invoke-InstallerCommandWithLockRetry" in script
+    assert '-Description "Python 后端依赖安装"' in script
+    assert '-Description "flocks 全局 CLI 安装"' in script
     assert "Failed to update Windows PE resources" in script
+    assert '& $ScriptBlock 2>&1' not in script
     assert "Stop-FlocksProcesses -Aggressive" not in script
     assert 'Get-Process -Name $name' not in script
     assert '"uv sync"' not in script
     assert '"vite preview"' not in script
 
 
-def test_powershell_installers_use_utf8_bom_with_crlf() -> None:
-    for path in (REPO_ROOT / "install.ps1", SCRIPT_DIR / "install.ps1"):
-        data = path.read_bytes()
-        assert data.startswith(b"\xef\xbb\xbf")
-        assert b"\r\n" in data
-        assert b"\n" not in data.replace(b"\r\n", b"")
+def test_bootstrap_powershell_installer_uses_utf8_without_bom_with_crlf() -> None:
+    data = (REPO_ROOT / "install.ps1").read_bytes()
+
+    assert not data.startswith(b"\xef\xbb\xbf")
+    assert b"\r\n" in data
+    assert b"\n" not in data.replace(b"\r\n", b"")
+
+
+def test_workspace_powershell_installer_uses_utf8_bom_with_crlf() -> None:
+    data = (SCRIPT_DIR / "install.ps1").read_bytes()
+
+    assert data.startswith(b"\xef\xbb\xbf")
+    assert b"\r\n" in data
+    assert b"\n" not in data.replace(b"\r\n", b"")
