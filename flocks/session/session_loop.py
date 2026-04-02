@@ -23,6 +23,11 @@ from flocks.session.session import Session, SessionInfo
 from flocks.session.message import Message, MessageInfo, MessageRole
 from flocks.session.core.status import SessionStatus, SessionStatusBusy, SessionStatusIdle, SessionStatusCompacting
 from flocks.session.core.task_utils import fire_and_forget
+from flocks.session.core.turn_state import (
+    set_turn_state,
+    set_context_state,
+    clear_turn_state,
+)
 from flocks.session.lifecycle.compaction import SessionCompaction, CompactionPolicy
 from flocks.session.prompt import SessionPrompt
 from flocks.provider.provider import Provider
@@ -32,6 +37,7 @@ log = Log.create(service="session.loop")
 
 
 MAX_OVERFLOW_COMPACTION_ATTEMPTS = 3
+POST_COMPACTION_COOLDOWN_STEPS = 2
 
 
 @dataclass
@@ -57,6 +63,9 @@ class LoopContext:
     overflow_compaction_attempts: int = 0
     # Tool result truncation attempted once per run (matches OpenClaw toolResultTruncationAttempted)
     tool_result_truncation_attempted: bool = False
+    # Cooldown window to prefer cheap cleanup over repeated full compaction.
+    last_compaction_step: Optional[int] = None
+    last_cleanup_step: Optional[int] = None
 
     @property
     def trace_step(self) -> int:
@@ -148,6 +157,79 @@ class SessionLoop:
                 aborted += 1
             aborted += cls.abort_children(sid)
         return aborted
+
+    @classmethod
+    async def _publish_runtime_event(
+        cls,
+        callbacks: "LoopCallbacks",
+        event_name: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        if not callbacks.event_publish_callback:
+            return
+        try:
+            await callbacks.event_publish_callback(event_name, payload)
+        except Exception as exc:
+            log.debug("loop.runtime_event.publish_failed", {
+                "event": event_name,
+                "error": str(exc),
+            })
+
+    @classmethod
+    async def _publish_session_notice(
+        cls,
+        callbacks: "LoopCallbacks",
+        session_id: str,
+        *,
+        level: str,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not callbacks.event_publish_callback:
+            return
+        try:
+            await callbacks.event_publish_callback("session.notice", {
+                "sessionID": session_id,
+                "level": level,
+                "message": message,
+                "details": details or {},
+            })
+        except Exception as exc:
+            log.debug("loop.session_notice.publish_failed", {"error": str(exc)})
+
+    @classmethod
+    def _has_recent_compaction_cooldown(cls, ctx: LoopContext) -> bool:
+        return (
+            ctx.last_compaction_step is not None
+            and (ctx.step - ctx.last_compaction_step) <= POST_COMPACTION_COOLDOWN_STEPS
+        )
+
+    @classmethod
+    async def _detect_queued_user_message(
+        cls,
+        _session_id: str,
+        post_messages: List[MessageInfo],
+        current_user_id: str,
+        last_message: Optional[MessageInfo],
+    ) -> Optional[MessageInfo]:
+        if not post_messages:
+            return None
+
+        newest_user = None
+        for msg in reversed(post_messages):
+            if msg.role == MessageRole.USER:
+                newest_user = msg
+                break
+
+        if newest_user is None:
+            return None
+        if newest_user.id <= current_user_id:
+            return None
+        if last_message is None:
+            return newest_user
+        if newest_user.id > last_message.id:
+            return newest_user
+        return None
     
     @classmethod
     async def run(
@@ -294,6 +376,7 @@ class SessionLoop:
             # Clean up
             if session_id in cls._active_loops:
                 del cls._active_loops[session_id]
+            clear_turn_state(session_id)
             
             # Set status to idle
             SessionStatus.set(session_id, SessionStatusIdle())
@@ -484,6 +567,13 @@ class SessionLoop:
             SessionStatus.set(ctx.session.id, SessionStatusBusy())
             
             ctx.step += 1
+            turn_state = set_turn_state(
+                ctx.session.id,
+                step=ctx.step,
+                status="started",
+                queued_message_detected=False,
+            )
+            await cls._publish_runtime_event(callbacks, "turn.started", turn_state.model_dump(by_alias=True))
             log.info("loop.step", {
                 "session_id": ctx.session.id,
                 "step": ctx.step,
@@ -703,6 +793,49 @@ class SessionLoop:
                         })
                     
                     try:
+                        current_input_tokens = (
+                            tokens_dict.get("input", 0)
+                            + (tokens_dict.get("cache", {}).get("read", 0) if isinstance(tokens_dict.get("cache"), dict) else 0)
+                        )
+                        recent_compaction = cls._has_recent_compaction_cooldown(ctx)
+                        near_overflow = current_input_tokens >= compaction_policy.preemptive_threshold
+
+                        if near_overflow and ctx.last_cleanup_step != ctx.step:
+                            try:
+                                trunc_count = await SessionCompaction.truncate_oversized_tool_outputs(
+                                    ctx.session.id,
+                                    context_window_tokens=model_context,
+                                )
+                                ctx.last_cleanup_step = ctx.step
+                                if trunc_count > 0:
+                                    set_context_state(
+                                        ctx.session.id,
+                                        tool_results_compacted=True,
+                                        last_compaction_step=ctx.last_compaction_step,
+                                        last_compaction_reason="pre_compact_cleanup",
+                                    )
+                                    await cls._publish_runtime_event(callbacks, "context.compacted", {
+                                        "sessionID": ctx.session.id,
+                                        "step": ctx.step,
+                                        "reason": "pre_compact_cleanup",
+                                        "truncatedToolResults": trunc_count,
+                                        "cooldownActive": recent_compaction,
+                                    })
+                                    log.info("loop.pre_compact_cleanup_applied", {
+                                        "session_id": ctx.session.id,
+                                        "step": ctx.step,
+                                        "truncated": trunc_count,
+                                        "preemptive_threshold": compaction_policy.preemptive_threshold,
+                                        "input_tokens": current_input_tokens,
+                                        "cooldown_active": recent_compaction,
+                                    })
+                                    continue
+                            except Exception as trunc_err:
+                                log.warn("loop.pre_compact_cleanup_error", {
+                                    "session_id": ctx.session.id,
+                                    "error": str(trunc_err),
+                                })
+
                         is_overflow = await SessionCompaction.is_overflow(
                             tokens=tokens_dict,
                             model_context=model_context,
@@ -721,6 +854,20 @@ class SessionLoop:
                             # Check if we've exhausted compaction attempts
                             # (matches OpenClaw MAX_OVERFLOW_COMPACTION_ATTEMPTS)
                             if ctx.overflow_compaction_attempts >= MAX_OVERFLOW_COMPACTION_ATTEMPTS:
+                                await cls._publish_session_notice(
+                                    callbacks,
+                                    ctx.session.id,
+                                    level="warning",
+                                    message=(
+                                        "当前任务上下文过重，已经多次 compact 仍接近上限。"
+                                        "建议收敛工具输出、缩小搜索范围，或开启新会话。"
+                                    ),
+                                    details={
+                                        "attempts": ctx.overflow_compaction_attempts,
+                                        "maxAttempts": MAX_OVERFLOW_COMPACTION_ATTEMPTS,
+                                        "tokens": tokens_dict,
+                                    },
+                                )
                                 log.error("loop.overflow_compaction_exhausted", {
                                     "session_id": ctx.session.id,
                                     "attempts": ctx.overflow_compaction_attempts,
@@ -775,6 +922,20 @@ class SessionLoop:
                             
                             # Recovery step 2: full compaction
                             ctx.overflow_compaction_attempts += 1
+                            if ctx.overflow_compaction_attempts >= 2:
+                                await cls._publish_session_notice(
+                                    callbacks,
+                                    ctx.session.id,
+                                    level="info",
+                                    message=(
+                                        "本轮上下文持续接近模型上限，系统将优先尝试压缩历史工具输出。"
+                                    ),
+                                    details={
+                                        "attempt": ctx.overflow_compaction_attempts,
+                                        "threshold": compaction_policy.overflow_threshold,
+                                        "buffer": compaction_policy.overflow_buffer,
+                                    },
+                                )
                             log.warn("loop.overflow_compaction_attempt", {
                                 "session_id": ctx.session.id,
                                 "attempt": ctx.overflow_compaction_attempts,
@@ -811,6 +972,20 @@ class SessionLoop:
                                 auto=True,
                                 policy=compaction_policy,
                             )
+                            ctx.last_compaction_step = ctx.step
+                            set_context_state(
+                                ctx.session.id,
+                                compaction_performed=True,
+                                last_compaction_step=ctx.step,
+                                last_compaction_reason="full_compaction",
+                            )
+                            await cls._publish_runtime_event(callbacks, "context.compacted", {
+                                "sessionID": ctx.session.id,
+                                "step": ctx.step,
+                                "reason": "full_compaction",
+                                "attempt": ctx.overflow_compaction_attempts,
+                                "cooldownUntilStep": ctx.step + POST_COMPACTION_COOLDOWN_STEPS,
+                            })
                             
                             # --- Compaction done: restore busy status ---
                             SessionStatus.set(ctx.session.id, SessionStatusBusy())
@@ -891,27 +1066,52 @@ class SessionLoop:
                         last_message = msg
                         break
 
-                # Before exiting, check if a newer user message arrived while
-                # we were processing (e.g. user sent input while we were stuck
-                # retrying).  If so, continue the loop so the new message gets
-                # processed instead of becoming an orphan.
-                if step_result.error and post_messages:
-                    newest_user = None
-                    for msg in reversed(post_messages):
-                        if msg.role == MessageRole.USER:
-                            newest_user = msg
-                            break
-                    if newest_user and last_message and newest_user.id > last_message.id:
-                        log.info("loop.continuing_for_queued_message", {
-                            "session_id": ctx.session.id,
-                            "queued_user_id": newest_user.id,
-                            "last_assistant_id": last_message.id,
-                        })
-                        continue
+                queued_user = await cls._detect_queued_user_message(
+                    ctx.session.id,
+                    post_messages,
+                    last_user.id,
+                    last_message,
+                )
+                if queued_user is not None:
+                    turn_state = set_turn_state(
+                        ctx.session.id,
+                        step=ctx.step,
+                        status="continued",
+                        continue_reason="queued_message",
+                        queued_message_detected=True,
+                    )
+                    await cls._publish_runtime_event(callbacks, "turn.continued", {
+                        **turn_state.model_dump(by_alias=True),
+                        "queuedUserMessageID": queued_user.id,
+                    })
+                    log.info("loop.continuing_for_queued_message", {
+                        "session_id": ctx.session.id,
+                        "queued_user_id": queued_user.id,
+                        "last_assistant_id": last_message.id if last_message else None,
+                    })
+                    continue
+
+                stop_reason = step_result.error or (getattr(last_message, "finish", None) if last_message else None) or "stop"
+                turn_state = set_turn_state(
+                    ctx.session.id,
+                    step=ctx.step,
+                    status="stopped",
+                    stop_reason=stop_reason,
+                    queued_message_detected=False,
+                )
+                await cls._publish_runtime_event(callbacks, "turn.stopped", turn_state.model_dump(by_alias=True))
 
                 break
             
             elif step_result.action == "continue":
+                turn_state = set_turn_state(
+                    ctx.session.id,
+                    step=ctx.step,
+                    status="continued",
+                    continue_reason="tool_calls",
+                    queued_message_detected=False,
+                )
+                await cls._publish_runtime_event(callbacks, "turn.continued", turn_state.model_dump(by_alias=True))
                 # Continue to next iteration
                 continue
             
@@ -930,6 +1130,7 @@ class SessionLoop:
             metadata={
                 "steps": ctx.step,
                 "session_id": ctx.session.id,
+                "last_compaction_step": ctx.last_compaction_step,
             },
         )
     
@@ -1054,7 +1255,6 @@ class SessionLoop:
         """
         from flocks.tool.registry import ToolRegistry
         from flocks.agent.registry import Agent
-        from flocks.permission import PermissionNext
         
         # Extract subtask information from part
         agent_name = getattr(task_part, 'agent', 'hephaestus')
@@ -1139,7 +1339,7 @@ class SessionLoop:
         result = None
         
         try:
-            result = await task_tool.execute(task_args, tool_ctx)
+            result = await task_tool.execute(tool_ctx, **task_args)
         except Exception as e:
             execution_error = e
             log.error("loop.subtask.execution_failed", {

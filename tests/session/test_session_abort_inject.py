@@ -9,6 +9,9 @@ Tests cover:
 """
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
 from flocks.session.session_loop import SessionLoop, LoopContext, LoopResult
@@ -230,6 +233,96 @@ class TestShouldExitWithInject:
         last_assistant = self._make_msg("msg_002", "assistant", finish=None)
 
         assert SessionLoop._should_exit(last_user, last_assistant) is False
+
+
+class TestQueuedUserDetection:
+    @staticmethod
+    def _make_msg(msg_id: str, role: str):
+        msg = type("Msg", (), {})()
+        msg.id = msg_id
+        msg.role = role
+        return msg
+
+    @pytest.mark.asyncio
+    async def test_does_not_treat_current_user_as_queued_when_no_assistant_exists(self):
+        current_user = self._make_msg("msg_001", "user")
+
+        queued = await SessionLoop._detect_queued_user_message(
+            "session-1",
+            [current_user],
+            current_user.id,
+            None,
+        )
+
+        assert queued is None
+
+    @pytest.mark.asyncio
+    async def test_detects_newer_user_when_step_failed_before_assistant_created(self):
+        current_user = self._make_msg("msg_001", "user")
+        newer_user = self._make_msg("msg_002", "user")
+
+        queued = await SessionLoop._detect_queued_user_message(
+            "session-1",
+            [current_user, newer_user],
+            current_user.id,
+            None,
+        )
+
+        assert queued is newer_user
+
+
+class TestExecuteSubtask:
+    @pytest.mark.asyncio
+    async def test_execute_subtask_passes_tool_context_first(self):
+        session_info = _make_session_info("subtask_exec_test")
+        ctx = LoopContext(
+            session=session_info,
+            provider_id="test-provider",
+            model_id="test-model",
+            agent_name="rex",
+        )
+        last_user = SimpleNamespace(
+            id="msg_parent",
+            agent="rex",
+            model={"providerID": "test-provider", "modelID": "test-model"},
+            provider="test-provider",
+        )
+        task_part = SimpleNamespace(
+            agent="helper",
+            prompt="do the thing",
+            description="test task",
+            command=None,
+            model=None,
+        )
+
+        task_tool = MagicMock()
+        task_tool.execute = AsyncMock(return_value=SimpleNamespace(
+            output="done",
+            title="task complete",
+            metadata={"sessionId": "child-session"},
+        ))
+
+        assistant_msg = SimpleNamespace(id="msg_assistant")
+        synthetic_msg = SimpleNamespace(id="msg_synthetic")
+
+        with patch("flocks.agent.registry.Agent.get", AsyncMock(return_value=SimpleNamespace(name="helper"))), \
+             patch("flocks.tool.registry.ToolRegistry.get", return_value=task_tool), \
+             patch("flocks.session.session_loop.Message.create", AsyncMock(side_effect=[assistant_msg, synthetic_msg])), \
+             patch("flocks.session.session_loop.Message.add_part", AsyncMock()), \
+             patch("flocks.session.session_loop.Message.update", AsyncMock()), \
+             patch("flocks.session.session_loop.Message.update_part", AsyncMock()):
+            await SessionLoop._execute_subtask(ctx, last_user, task_part)
+
+        task_tool.execute.assert_awaited_once()
+        tool_ctx = task_tool.execute.await_args.args[0]
+        assert tool_ctx.session_id == session_info.id
+        assert tool_ctx.message_id == assistant_msg.id
+        assert task_tool.execute.await_args.kwargs == {
+            "prompt": "do the thing",
+            "description": "test task",
+            "subagent_type": "helper",
+            "command": None,
+        }
 
 
 # ---------------------------------------------------------------------------

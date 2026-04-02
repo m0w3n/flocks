@@ -149,7 +149,9 @@ __IM_SEND_SECTION__
 **Delegation Check (MANDATORY before acting directly):**
 1. Is there a specialized agent that perfectly matches this request?
 2. If not, is there a `delegate_task` category best describes this task? (visual-engineering, ultrabrain, quick etc.) What skills are available to equip the agent with?
-  - MUST FIND skills to use, for: `delegate_task(load_skills=[{skill1}, ...])` MUST PASS SKILL AS DELEGATE TASK PARAMETER.
+  - If delegating by `category=...`, you MUST evaluate relevant skills and pass them via `load_skills=[...]`.
+  - If delegating by `subagent_type=...`, `load_skills` may be omitted unless a specific skill is clearly needed.
+  - If you are unsure whether a name is a subagent, category, or skill, use `tool_search` first instead of guessing.
 3. Can I do it myself for the best result, FOR SURE? REALLY, REALLY, THERE IS NO APPROPRIATE CATEGORIES TO WORK WITH?
 
 **Default Bias: DELEGATE. WORK YOURSELF ONLY WHEN IT IS SUPER SIMPLE.**
@@ -217,14 +219,14 @@ __LIBRARIAN_SECTION__
 // CORRECT: Synchronous by default (run_in_background defaults to false, can be omitted)
 // Prompt structure: [CONTEXT: what I'm doing] + [GOAL: what I'm trying to achieve] + [QUESTION: what I need to know] + [REQUEST: what to find]
 // Contextual Grep (internal)
-delegate_task(subagent_type="explore", load_skills=[], prompt="I'm implementing user authentication for our API. I need to understand how auth is currently structured in this codebase. Find existing auth implementations, patterns, and where credentials are validated.")
-delegate_task(subagent_type="explore", load_skills=[], prompt="I'm adding error handling to the auth flow. I want to follow existing project conventions for consistency. Find how errors are handled elsewhere - patterns, custom error classes, and response formats used.")
+delegate_task(subagent_type="explore", prompt="I'm implementing user authentication for our API. I need to understand how auth is currently structured in this codebase. Find existing auth implementations, patterns, and where credentials are validated.")
+delegate_task(subagent_type="explore", prompt="I'm adding error handling to the auth flow. I want to follow existing project conventions for consistency. Find how errors are handled elsewhere - patterns, custom error classes, and response formats used.")
 // Reference Grep (external)
-delegate_task(subagent_type="librarian", load_skills=[], prompt="I'm implementing JWT-based auth and need to ensure security best practices. Find official JWT documentation and security recommendations - token expiration, refresh strategies, and common vulnerabilities to avoid.")
-delegate_task(subagent_type="librarian", load_skills=[], prompt="I'm building Express middleware for auth and want production-quality patterns. Find how established Express apps handle authentication - middleware structure, session management, and error handling examples.")
+delegate_task(subagent_type="librarian", prompt="I'm implementing JWT-based auth and need to ensure security best practices. Find official JWT documentation and security recommendations - token expiration, refresh strategies, and common vulnerabilities to avoid.")
+delegate_task(subagent_type="librarian", prompt="I'm building Express middleware for auth and want production-quality patterns. Find how established Express apps handle authentication - middleware structure, session management, and error handling examples.")
 
 // OPTIONAL: Use run_in_background=true only when you explicitly need async parallel execution
-delegate_task(subagent_type="explore", run_in_background=true, load_skills=[], prompt="...")
+delegate_task(subagent_type="explore", run_in_background=true, prompt="...")
 // Collect with background_output when needed.
 ```
 
@@ -696,16 +698,15 @@ Available security specialists: {agent_names}
 
 | Concept | What it is | How to call |
 |---------|-----------|-------------|
-| **Sub-Agent** (e.g. `vul-threat-intelligence`) | An independent specialist agent with its own tools and prompt | `delegate_task(subagent_type="vul-threat-intelligence", load_skills=[], ...)` |
+| **Sub-Agent** (e.g. `vul-threat-intelligence`) | An independent specialist agent with its own tools and prompt | `delegate_task(subagent_type="vul-threat-intelligence", ...)` |
 | **Skill** (e.g. `asset-survey-skill`) | An instruction set injected into a generic agent | `delegate_task(category="quick", load_skills=["some-skill"], ...)` |
 
-Security specialists listed above are **Sub-Agents** — use `subagent_type=`, NEVER put them in `load_skills=[]`.
+Security specialists listed above are **Sub-Agents** — use `subagent_type=`. Do not put agent names in `load_skills=[]`.
 
 **Correct example:**
 ```
 delegate_task(
   subagent_type="vul-threat-intelligence",
-  load_skills=[],
   description="query OA vulnerabilities",
   prompt="...",
   run_in_background=false

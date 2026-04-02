@@ -98,6 +98,30 @@ class ToolInfo(BaseModel):
         "plugin tools (<cwd>/.flocks/plugins/tools/). False for user-level plugin tools "
         "(~/.flocks/plugins/tools/). Determined by loading context, not declared in YAML."
     ))
+    should_defer: Optional[bool] = Field(
+        None,
+        description="Whether the tool should be hidden until discovered by tool_search",
+    )
+    always_load: Optional[bool] = Field(
+        None,
+        description="Whether the tool should always be exposed in each request",
+    )
+    risk_level: Optional[str] = Field(
+        None,
+        description="Risk level used by tool governance, e.g. low/medium/high",
+    )
+    requires_trust: Optional[bool] = Field(
+        None,
+        description="Whether the tool should only be exposed in a trusted workspace",
+    )
+    permission_key: Optional[str] = Field(
+        None,
+        description="Logical permission/risk key used by tool governance",
+    )
+    tags: List[str] = Field(
+        default_factory=list,
+        description="Lightweight retrieval tags used by tool_search and selector scoring",
+    )
 
     def get_schema(self) -> ToolSchema:
         """Generate JSON Schema for this tool."""
@@ -402,6 +426,15 @@ class ToolRegistry:
     @classmethod
     def register(cls, tool: Tool) -> None:
         """Register a tool"""
+        try:
+            from flocks.tool.policy import apply_policy_defaults
+
+            tool.info = apply_policy_defaults(tool.info)
+        except Exception as e:
+            log.debug("tool.policy_defaults.apply_failed", {
+                "name": tool.info.name,
+                "error": str(e),
+            })
         cls._tools[tool.info.name] = tool
         log.debug("tool.registered", {
             "name": tool.info.name,
@@ -438,6 +471,12 @@ class ToolRegistry:
         parameters: Optional[List[ToolParameter]] = None,
         requires_confirmation: bool = False,
         native: bool = False,
+        should_defer: Optional[bool] = None,
+        always_load: Optional[bool] = None,
+        risk_level: Optional[str] = None,
+        requires_trust: Optional[bool] = None,
+        permission_key: Optional[str] = None,
+        tags: Optional[List[str]] = None,
     ) -> Callable[[ToolHandler], ToolHandler]:
         """
         Decorator to register a function as a tool.
@@ -450,11 +489,11 @@ class ToolRegistry:
 
         Usage:
             @ToolRegistry.register_function(
-                name="read_file",
+                name="read",
                 description="Read file contents",
-                parameters=[ToolParameter(name="path", type=ParameterType.STRING)]
+                parameters=[ToolParameter(name="filePath", type=ParameterType.STRING)]
             )
-            async def read_file(ctx: ToolContext, path: str) -> ToolResult:
+            async def read_tool(ctx: ToolContext, filePath: str) -> ToolResult:
                 ...
         """
         def decorator(func: ToolHandler) -> ToolHandler:
@@ -466,6 +505,12 @@ class ToolRegistry:
                 parameters=parameters or [],
                 requires_confirmation=requires_confirmation,
                 native=native,
+                should_defer=should_defer,
+                always_load=always_load,
+                risk_level=risk_level,
+                requires_trust=requires_trust,
+                permission_key=permission_key,
+                tags=list(tags or []),
             )
             tool = Tool(info=info, handler=func)
             cls.register(tool)
@@ -878,7 +923,7 @@ class ToolRegistry:
             # security/ — SSH forensics + threat intelligence (optional: asyncssh)
             ("flocks.tool.security", ["ssh_host_cmd", "ssh_run_script"]),
             # system/ — background tasks, questions, model config, memory, skill, batch, session management, slash commands
-            ("flocks.tool.system", ["background_output", "background_cancel", "question", "model_config", "memory", "skill", "batch", "session_manage", "slash_command"]),
+            ("flocks.tool.system", ["background_output", "background_cancel", "question", "model_config", "memory", "skill", "batch", "session_manage", "slash_command", "tool_search"]),
             # skill/ — skill management (search, install, status, deps, remove)
             ("flocks.tool.skill", ["flocks_skills"]),
             # channel/ — IM platform messaging

@@ -59,6 +59,7 @@ class SessionCreateRequest(BaseModel):
     title: Optional[str] = Field(None, description="Session title")
     permission: Optional[List[PermissionRule]] = Field(None, description="Permission rules")
     category: Optional[str] = Field(None, description="Session category (e.g. 'user', 'workflow')")
+    trusted: Optional[bool] = Field(None, description="Workspace trust flag for high-risk tools")
 
 
 class FileDiff(BaseModel):
@@ -104,6 +105,7 @@ class SessionResponse(BaseModel):
     permission: Optional[List[Dict[str, Any]]] = Field(None, description="Permission rules")
     revert: Optional[Dict[str, Any]] = Field(None, description="Revert state")
     category: str = Field("user", description="Session category: user or task")
+    trusted: Optional[bool] = Field(None, description="Workspace trust flag")
 
 
 def _session_to_response(session: SessionModel) -> SessionResponse:
@@ -132,6 +134,7 @@ def _session_to_response(session: SessionModel) -> SessionResponse:
         revert=session.revert.model_dump(by_alias=True) if session.revert else None,
         permission=[p.model_dump() for p in session.permission] if session.permission else None,
         category=session.category,
+        trusted=(session.metadata or {}).get("trusted"),
     )
 
 
@@ -157,10 +160,15 @@ async def get_session_status() -> Dict[str, Any]:
     Flocks compatible endpoint.
     """
     from flocks.session.core.status import SessionStatus
+    from flocks.session.core.turn_state import get_turn_state, get_context_state
     
     statuses = SessionStatus.list()
     return {
-        session_id: status.model_dump() 
+        session_id: {
+            **status.model_dump(),
+            "turn": get_turn_state(session_id).model_dump(by_alias=True),
+            "context": get_context_state(session_id).model_dump(by_alias=True),
+        }
         for session_id, status in statuses.items()
     }
 
@@ -280,7 +288,10 @@ async def create_session(request: Optional[SessionCreateRequest] = None) -> Sess
         title=request.title,
         parent_id=request.parentID,
         permission=permission,
-        **({"category": request.category} if request.category else {}),
+        **({
+            **({"category": request.category} if request.category else {}),
+            **({"metadata": {"trusted": request.trusted}} if request.trusted is not None else {}),
+        }),
     )
     
     log.info("session.created", {"session_id": session.id})
@@ -409,6 +420,7 @@ class SessionUpdateRequest(BaseModel):
     
     title: Optional[str] = Field(None, description="New title")
     time: Optional[Dict[str, Any]] = Field(None, description="Time updates (archived)")
+    trusted: Optional[bool] = Field(None, description="Workspace trust flag")
 
 
 @router.patch(
@@ -435,6 +447,11 @@ async def update_session(
         updates["title"] = request.title
     if request.time and request.time.get("archived") is not None:
         updates["archived"] = request.time["archived"]
+    if request.trusted is not None:
+        updates["metadata"] = {
+            **(existing.metadata or {}),
+            "trusted": request.trusted,
+        }
     
     session = await Session.update(
         project_id=existing.project_id,
@@ -2130,7 +2147,7 @@ async def respond_to_permission(
     """Respond to permission request"""
     from flocks.permission.next import PermissionNext
     
-    PermissionNext.reply(
+    await PermissionNext.reply(
         request_id=permissionID,
         reply=request.response,
     )

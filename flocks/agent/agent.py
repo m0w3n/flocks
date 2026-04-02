@@ -140,6 +140,9 @@ class AgentInfo(BaseModel):
 
     # Raw tools list from agent.yaml (None → allow-all fallback).
     tools: Optional[List[str]] = Field(default=None)
+    allowed_tools: List[str] = Field(default_factory=list)
+    disallowed_tools: List[str] = Field(default_factory=list)
+    tool_policy_preset: Optional[str] = Field(default=None)
 
     model: Optional[AgentModel] = None
     prompt: Optional[str] = None
