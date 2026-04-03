@@ -1,9 +1,10 @@
+import asyncio
 from pathlib import Path
 import tempfile
 
 import pytest
 
-from flocks.permission.next import PermissionNext, PermissionRequestInfo
+from flocks.permission.next import DeniedError, PermissionNext, PermissionRequestInfo
 from flocks.storage.storage import Storage
 
 
@@ -69,6 +70,64 @@ async def test_reply_persists_session_rule_without_in_memory_future(permission_s
 
     assert PermissionNext._session_permissions[request.session_id]["write"] == "allow"
     assert await Storage.get(f"{PermissionNext._SESSION_PREFIX}{request.session_id}") == {"write": "allow"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply", ["allow", "once"])
+async def test_reply_unblocks_waiting_request_via_persisted_reply_when_memory_future_missing(
+    permission_storage,
+    reply: str,
+) -> None:
+    request_id = f"per_waiting_{reply}"
+    ask_task = asyncio.create_task(
+        PermissionNext.ask(
+            session_id="ses_waiting_allow",
+            permission="bash",
+            patterns=["*"],
+            ruleset=[],
+            metadata={"messageID": "msg_waiting_allow"},
+            request_id=request_id,
+        )
+    )
+
+    while request_id not in PermissionNext._pending:
+        await asyncio.sleep(0)
+
+    PermissionNext._pending.pop(request_id, None)
+
+    await PermissionNext.reply(request_id, reply, session_id="ses_waiting_allow")
+    await asyncio.wait_for(ask_task, timeout=2)
+
+    assert await Storage.get(f"{PermissionNext._REPLY_PREFIX}{request_id}") is None
+
+
+@pytest.mark.asyncio
+async def test_reply_denies_waiting_request_via_persisted_reply_when_memory_future_missing(
+    permission_storage,
+) -> None:
+    request_id = "per_waiting_deny"
+    ask_task = asyncio.create_task(
+        PermissionNext.ask(
+            session_id="ses_waiting_deny",
+            permission="write",
+            patterns=["notes.md"],
+            ruleset=[],
+            metadata={"messageID": "msg_waiting_deny"},
+            request_id=request_id,
+        )
+    )
+
+    while request_id not in PermissionNext._pending:
+        await asyncio.sleep(0)
+
+    PermissionNext._pending.pop(request_id, None)
+
+    await PermissionNext.reply(request_id, "deny", session_id="ses_waiting_deny")
+
+    with pytest.raises(DeniedError):
+        await asyncio.wait_for(ask_task, timeout=2)
+
+    assert await Storage.get(f"{PermissionNext._REPLY_PREFIX}{request_id}") is None
 
 
 @pytest.mark.asyncio

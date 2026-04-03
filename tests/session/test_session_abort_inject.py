@@ -14,8 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from flocks.session.session_loop import SessionLoop, LoopContext, LoopResult
-from flocks.session.runner import SessionRunner
+from flocks.session.session_loop import SessionLoop, LoopCallbacks, LoopContext, LoopResult
+from flocks.session.runner import SessionRunner, StepResult
 from flocks.session.session import SessionInfo
 from flocks.server.routes import session as session_routes
 
@@ -269,6 +269,84 @@ class TestQueuedUserDetection:
         )
 
         assert queued is newer_user
+
+
+class TestTurnLifecycle:
+    @staticmethod
+    def _make_msg(msg_id: str, role: str, finish: str = None, *, tokens=None, summary: bool = False):
+        msg = type("Msg", (), {})()
+        msg.id = msg_id
+        msg.role = role
+        msg.finish = finish
+        msg.tokens = tokens
+        msg.summary = summary
+        return msg
+
+    @pytest.mark.asyncio
+    async def test_pre_compact_cleanup_emits_turn_continued_before_next_iteration(self):
+        session = SimpleNamespace(
+            id="turn_cleanup_session",
+            agent="rex",
+            directory="/tmp",
+            memory_enabled=False,
+        )
+        ctx = LoopContext(
+            session=session,
+            provider_id="test-provider",
+            model_id="test-model",
+            agent_name="rex",
+        )
+        overflow_messages = [
+            self._make_msg("msg_001", "user"),
+            self._make_msg(
+                "msg_002",
+                "assistant",
+                finish="tool-calls",
+                tokens={"input": 50000, "output": 0, "cache": {"read": 0, "write": 0}},
+            ),
+        ]
+        normal_messages = [
+            self._make_msg("msg_001", "user"),
+            self._make_msg(
+                "msg_002",
+                "assistant",
+                finish="tool-calls",
+                tokens={"input": 0, "output": 0, "cache": {"read": 0, "write": 0}},
+            ),
+        ]
+        ctx.session_ctx = SimpleNamespace(
+            get_messages=AsyncMock(side_effect=[overflow_messages, normal_messages, normal_messages])
+        )
+        event_callback = AsyncMock()
+        callbacks = LoopCallbacks(event_publish_callback=event_callback)
+
+        with patch(
+            "flocks.session.session_loop.Provider.resolve_model_info",
+            return_value=(20000, 1024, None),
+        ), patch(
+            "flocks.session.session_loop.SessionCompaction.truncate_oversized_tool_outputs",
+            AsyncMock(return_value=1),
+        ), patch(
+            "flocks.session.session_loop.SessionPrompt.estimate_full_context_tokens",
+            AsyncMock(return_value=0),
+        ), patch(
+            "flocks.session.runner.SessionRunner._process_step",
+            AsyncMock(return_value=StepResult(action="stop")),
+        ):
+            result = await SessionLoop._run_loop(ctx, callbacks)
+
+        assert result.action == "stop"
+        event_names = [call.args[0] for call in event_callback.await_args_list]
+        assert event_names == [
+            "turn.started",
+            "context.compacted",
+            "turn.continued",
+            "turn.started",
+            "turn.stopped",
+        ]
+        cleanup_turn = event_callback.await_args_list[2].args[1]
+        assert cleanup_turn["continue_reason"] == "pre_compact_cleanup"
+        assert cleanup_turn["status"] == "continued"
 
 
 class TestExecuteSubtask:

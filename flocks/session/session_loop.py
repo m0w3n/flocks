@@ -829,6 +829,18 @@ class SessionLoop:
                                         "input_tokens": current_input_tokens,
                                         "cooldown_active": recent_compaction,
                                     })
+                                    turn_state = set_turn_state(
+                                        ctx.session.id,
+                                        step=ctx.step,
+                                        status="continued",
+                                        continue_reason="pre_compact_cleanup",
+                                        queued_message_detected=False,
+                                    )
+                                    await cls._publish_runtime_event(
+                                        callbacks,
+                                        "turn.continued",
+                                        turn_state.model_dump(by_alias=True),
+                                    )
                                     continue
                             except Exception as trunc_err:
                                 log.warn("loop.pre_compact_cleanup_error", {

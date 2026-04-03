@@ -61,6 +61,7 @@ class PermissionNext:
     _state_loaded: bool = False
 
     _PENDING_PREFIX = "permission_pending:"
+    _REPLY_PREFIX = "permission_reply:"
     _SESSION_PREFIX = "permission_session:"
     _PERMANENT_PREFIX = "permission_rule:"
 
@@ -128,6 +129,44 @@ class PermissionNext:
     @classmethod
     async def _delete_pending_request(cls, request_id: str) -> None:
         await Storage.delete(f"{cls._PENDING_PREFIX}{request_id}")
+
+    @classmethod
+    async def _persist_reply(
+        cls,
+        request_id: str,
+        reply: str,
+        *,
+        session_id: Optional[str] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "reply": reply,
+            "time": {"created": int(datetime.now().timestamp() * 1000)},
+        }
+        if session_id:
+            payload["sessionID"] = session_id
+        await Storage.set(
+            f"{cls._REPLY_PREFIX}{request_id}",
+            payload,
+            "permission_reply",
+        )
+
+    @classmethod
+    async def _delete_reply(cls, request_id: str) -> None:
+        await Storage.delete(f"{cls._REPLY_PREFIX}{request_id}")
+
+    @classmethod
+    async def _consume_persisted_reply(cls, request_id: str) -> Optional[str]:
+        stored = await Storage.get(f"{cls._REPLY_PREFIX}{request_id}")
+        if stored is None:
+            return None
+        await cls._delete_reply(request_id)
+        if isinstance(stored, dict):
+            reply = stored.get("reply")
+        else:
+            reply = stored
+        if not reply:
+            return None
+        return str(reply)
 
     @classmethod
     async def _persist_permanent_rule(cls, permission: str, action: str) -> None:
@@ -301,13 +340,29 @@ class PermissionNext:
         except Exception as exc:
             log.debug("permission.request.publish_failed", {"error": str(exc)})
 
-        try:
-            reply = await asyncio.wait_for(future, timeout=300)
-        except asyncio.TimeoutError:
-            if req_id in cls._pending:
-                del cls._pending[req_id]
-            cls._schedule_persist(cls._delete_pending_request(req_id))
-            raise PermissionError(f"Permission request timed out: {permission}")
+        timeout_at = asyncio.get_running_loop().time() + 300
+        reply: Optional[str] = None
+        while reply is None:
+            persisted_reply = await cls._consume_persisted_reply(req_id)
+            if persisted_reply is not None:
+                reply = persisted_reply
+                break
+
+            remaining = timeout_at - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                if req_id in cls._pending:
+                    del cls._pending[req_id]
+                cls._schedule_persist(cls._delete_pending_request(req_id))
+                cls._schedule_persist(cls._delete_reply(req_id))
+                raise PermissionError(f"Permission request timed out: {permission}")
+
+            try:
+                reply = await asyncio.wait_for(asyncio.shield(future), timeout=min(0.25, remaining))
+            except asyncio.TimeoutError:
+                continue
+
+        cls._pending.pop(req_id, None)
+        cls._schedule_persist(cls._delete_reply(req_id))
 
         if reply in ("allow", "once"):
             return
@@ -345,12 +400,21 @@ class PermissionNext:
 
         if pending is None:
             log.warn("permission.reply.not_found", {"request_id": request_id})
+            resolved_session_id = session_id or (pending_info.session_id if pending_info else None)
+            await cls._persist_reply(request_id, reply, session_id=resolved_session_id)
             if pending_info is not None:
                 await cls._apply_reply_without_future(
                     pending_info,
                     reply,
                     session_id=session_id,
                 )
+            if cls._on_permission_replied and resolved_session_id:
+                try:
+                    task = cls._on_permission_replied(resolved_session_id, request_id, reply)
+                    if asyncio.iscoroutine(task):
+                        asyncio.create_task(task)
+                except Exception as exc:
+                    log.debug("permission.reply.callback_failed", {"error": str(exc)})
             return
 
         future = pending["future"]
