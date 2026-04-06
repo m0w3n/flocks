@@ -16,6 +16,8 @@ import zipfile
 from pathlib import Path
 from typing import Callable
 
+from defusedxml import ElementTree as DefusedET
+
 from flocks.tool.registry import (
     ParameterType,
     ToolCategory,
@@ -85,6 +87,10 @@ def _looks_like_markdown(line: str) -> bool:
     markdown_prefixes = ("#", "-", "*", "+", ">", "|", "```")
     ordered_list = re.match(r"^\d+\.\s", stripped)
     return stripped.startswith(markdown_prefixes) or ordered_list is not None
+
+
+def _safe_xml_fromstring(payload: bytes | str) -> ET.Element:
+    return DefusedET.fromstring(payload)
 
 
 def _sanitize_stem(path: Path) -> str:
@@ -163,7 +169,7 @@ def _docx_styles(archive: zipfile.ZipFile) -> dict[str, str]:
     except KeyError:
         return {}
 
-    root = ET.fromstring(styles_xml)
+    root = _safe_xml_fromstring(styles_xml)
     styles: dict[str, str] = {}
     for style in root.findall("w:style", WORD_NAMESPACE):
         style_id = style.get(_word_tag("styleId")) or style.get("styleId")
@@ -277,7 +283,7 @@ def _extract_docx_with_zipxml(file_path: Path) -> str:
         document_xml = archive.read("word/document.xml")
         styles = _docx_styles(archive)
 
-    root = ET.fromstring(document_xml)
+    root = _safe_xml_fromstring(document_xml)
     body = root.find("w:body", WORD_NAMESPACE)
     if body is None:
         return ""

@@ -4,6 +4,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from defusedxml.common import DefusedXmlException
 
 from flocks.tool.registry import ToolContext, ToolRegistry
 from flocks.workspace.manager import WorkspaceManager
@@ -166,6 +167,27 @@ def test_docx_xml_fallback_preserves_soft_line_breaks(tmp_path, doc_parser_modul
     content = doc_parser_module._extract_docx_with_zipxml(source)
 
     assert "第一行\n第二行" in content
+
+
+def test_docx_xml_fallback_rejects_xml_entities(tmp_path, doc_parser_module):
+    source = tmp_path / "entity.docx"
+    document = textwrap.dedent("""\
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <!DOCTYPE w:document [
+          <!ENTITY secret "blocked">
+        ]>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:body>
+            <w:p>
+              <w:r><w:t>&secret;</w:t></w:r>
+            </w:p>
+          </w:body>
+        </w:document>
+    """)
+    _write_minimal_docx(source, document_xml=document)
+
+    with pytest.raises(DefusedXmlException):
+        doc_parser_module._extract_docx_with_zipxml(source)
 
 
 def test_doc_fallback_prefers_pandoc_before_olefile(monkeypatch, tmp_path, doc_parser_module):

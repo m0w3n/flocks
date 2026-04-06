@@ -71,6 +71,7 @@ dependencies = [
     "markitdown>=0.1.5",
     "pymupdf>=1.27.2.2",
     "olefile>=0.47",
+    "defusedxml>=0.7.1",
 ]
 
 [dependency-groups]

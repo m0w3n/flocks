@@ -319,6 +319,28 @@ class TestUpload:
         assert (_ws(workspace_client) / "uploads" / "report.pdf").read_bytes() == b"first"
         assert (_ws(workspace_client) / "uploads" / "report (1).pdf").read_bytes() == b"second"
 
+    def test_chat_upload_returns_error_after_too_many_name_conflicts(self, workspace_client, monkeypatch):
+        from flocks.server.routes import workspace as workspace_routes
+
+        monkeypatch.setattr(workspace_routes, "_MAX_UPLOAD_RENAME_ATTEMPTS", 1)
+        ws = _ws(workspace_client)
+        uploads_dir = ws / "uploads"
+        uploads_dir.mkdir(exist_ok=True)
+        (uploads_dir / "report.pdf").write_bytes(b"first")
+        (uploads_dir / "report (1).pdf").write_bytes(b"second")
+
+        r = _client(workspace_client).post(
+            "/api/workspace/upload?dest=uploads&purpose=chat",
+            files=[("files", ("report.pdf", b"third", "application/pdf"))],
+        )
+
+        assert r.status_code == 409
+        assert "Too many conflicting filenames" in r.json()["detail"]
+        result = r.json()["uploaded"][0]
+        assert "Too many conflicting filenames" in result["error"]
+        assert (uploads_dir / "report.pdf").read_bytes() == b"first"
+        assert (uploads_dir / "report (1).pdf").read_bytes() == b"second"
+
     def test_upload_too_large_file_rejected(self, workspace_client, monkeypatch):
         # Set the limit to 0 MB; _max_upload_bytes() reads the env var at
         # request time so no module-level patching is needed.

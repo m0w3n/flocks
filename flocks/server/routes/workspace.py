@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import List, Optional, Literal
 
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from flocks.workspace.manager import WorkspaceManager
@@ -62,6 +62,7 @@ _ALLOWED_UPLOAD_EXTENSIONS = {
     ".pdf", ".doc", ".docx",
 }
 _ALLOWED_UPLOAD_LABEL = "txt, md, json, yaml, yml, xml, csv, pdf, doc, docx"
+_MAX_UPLOAD_RENAME_ATTEMPTS = 100
 
 
 def _max_upload_bytes() -> int:
@@ -88,11 +89,16 @@ def _resolve_upload_target(dest_dir: Path, filename: str, *, auto_rename: bool) 
     stem = candidate.stem
     suffix = candidate.suffix
     counter = 1
-    while True:
+    while counter <= _MAX_UPLOAD_RENAME_ATTEMPTS:
         renamed = dest_dir / f"{stem} ({counter}){suffix}"
         if not renamed.exists():
             return renamed
         counter += 1
+
+    raise ValueError(
+        f"Too many conflicting filenames for upload: {filename}. "
+        "Please rename the file and try again."
+    )
 
 
 def _node_from_path(path: Path, root: Path) -> WorkspaceNode:
@@ -252,6 +258,7 @@ async def upload_files(
     max_mb = max_bytes // (1024 * 1024)
 
     results = []
+    conflict_detail: str | None = None
     for upload in files:
         raw_name: Optional[str] = upload.filename
         if not raw_name:
@@ -286,7 +293,13 @@ async def upload_files(
             continue
 
         content = b"".join(chunks)
-        target = _resolve_upload_target(dest_dir, filename, auto_rename=purpose == "chat")
+        try:
+            target = _resolve_upload_target(dest_dir, filename, auto_rename=purpose == "chat")
+        except ValueError as exc:
+            message = str(exc)
+            results.append({"name": filename, "error": message})
+            conflict_detail = message
+            continue
         target.write_bytes(content)
 
         is_text = WorkspaceManager.is_text_file(target)
@@ -304,6 +317,9 @@ async def upload_files(
             "is_text_file": is_text,
             "preview_warning": None if is_text else "Binary file — download only",
         })
+
+    if conflict_detail is not None:
+        return JSONResponse(status_code=409, content={"detail": conflict_detail, "uploaded": results})
 
     return {"uploaded": results}
 

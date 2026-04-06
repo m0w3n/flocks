@@ -60,6 +60,7 @@ export const workspaceAPI = {
       params: { dest, purpose },
       headers: { 'Content-Type': undefined },
       timeout: 0,
+      validateStatus: (status) => (status >= 200 && status < 300) || status === 409,
     });
   },
 
